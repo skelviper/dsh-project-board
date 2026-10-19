@@ -1,0 +1,32 @@
+{
+  "name": "dsh-project-board",
+  "version": "0.1.0",
+  "description": "Workspace project boards, linked conversations, and Agent Team dispatch for DeepSeek Harness Web.",
+  "license": "MIT",
+  "type": "module",
+  "main": "entry.mjs",
+  "exports": {
+    ".": "./entry.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "entry.mjs", "host.mjs", "client.js", "cordis.patch.yml",
+    "index.mjs", "schema.mjs", "store.mjs", "service.mjs", "thread.mjs",
+    "build-host.mjs", "build-client.mjs", "client-src/", "docs/", "README.md", "LICENSE", "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "node build-host.mjs && node build-client.mjs",
+    "check": "node --check host.mjs && node --check client.js",
+    "test": "node --test tests/*.test.mjs",
+    "prepack": "npm run build && npm run check"
+  },
+  "engines": { "node": ">=22", "dsh": "0.2.1-rc.2" },
+  "dependencies": { "@deepseek-ai/dsh-tools": "0.2.1-rc.2" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true }
+  },
+  "keywords": ["dsh", "deepseek-harness", "project-board", "agent-team", "workspace"]
+}

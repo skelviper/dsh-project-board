@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 
-const source = ['state.js', 'inspector.js'].map(name => fs.readFileSync(new URL('../client-src/' + name, import.meta.url), 'utf8')).join('\n');
+const source = fs.readFileSync(new URL('../board-model.js', import.meta.url), 'utf8').replace(/^export /gm, '') + '\n' + ['state.js', 'inspector.js'].map(name => fs.readFileSync(new URL('../client-src/' + name, import.meta.url), 'utf8')).join('\n');
 function fixture(onSubmit = async () => null) {
   const slots = []; let cursor = 0;
   const context = { React: {
@@ -18,13 +18,15 @@ function fixture(onSubmit = async () => null) {
 
 test('混合任务按末级条目计数，不漏掉无待办任务', () => {
   const { api } = fixture();
-  const board = { tasks: [{ id: 't1', nodeId: 'n', status: 'doing' }, { id: 't2', nodeId: 'n', status: 'todo' }], todos: [{ taskId: 't1', status: 'done' }] };
-  assert.equal(JSON.stringify(api.pbNodeProgress(board, 'n')), JSON.stringify({ done: 1, total: 2, pct: 50 }));
+  const board = { nodes: [{ id: 'n' }], tasks: [{ id: 't1', nodeId: 'n', status: 'doing' }, { id: 't2', nodeId: 'n', status: 'todo' }], todos: [{ taskId: 't1', status: 'done' }] };
+  const progress = api.pbNodeProgress(board, 'n');
+  assert.deepEqual([progress.done, progress.total, progress.closed, progress.pct], [1, 2, 1, 50]);
   assert.equal(api.pbNodeProgress(board, 'empty'), null);
   board.todos = [];
   board.tasks[0].status = 'dropped';
   assert.equal(api.pbNodeProgress(board, 'n').total, 2);
-  assert.equal(api.pbNodeProgress(board, 'n').done, 1);
+  assert.equal(api.pbNodeProgress(board, 'n').done, 0);
+  assert.equal(api.pbNodeProgress(board, 'n').closed, 1);
 });
 
 test('中文组合输入、兼容键码与长按回车均不提交', () => {

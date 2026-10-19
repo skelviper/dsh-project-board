@@ -3,9 +3,67 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
+// 浏览器与宿主共用的纯函数，不依赖 DOM、React 或 Node API。
+function pbNodeIdsInScope(board, nodeId = null) {
+  const nodes = Array.isArray(board?.nodes) ? board.nodes : [];
+  const known = new Set(nodes.map(node => node.id));
+  if (nodeId === null) return [...known];
+  if (!known.has(nodeId)) return [];
+  const children = new Map();
+  for (const edge of board?.edges || []) {
+    if (edge.kind !== 'contains' || !known.has(edge.from) || !known.has(edge.to)) continue;
+    if (!children.has(edge.from)) children.set(edge.from, []);
+    children.get(edge.from).push(edge.to);
+  }
+  const seen = new Set(), pending = [nodeId];
+  while (pending.length) {
+    const id = pending.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    pending.push(...(children.get(id) || []));
+  }
+  return [...seen];
+}
+
+function pbScopeStats(board, nodeId = null) {
+  const nodeIds = pbNodeIdsInScope(board, nodeId);
+  const scope = new Set(nodeIds), seenTasks = new Set(), seenTodos = new Set();
+  const tasks = (board?.tasks || []).filter(task => {
+    if ((nodeId !== null && !scope.has(task.nodeId)) || seenTasks.has(task.id)) return false;
+    seenTasks.add(task.id); return true;
+  });
+  const todosByTask = new Map();
+  for (const todo of board?.todos || []) {
+    if (!seenTasks.has(todo.taskId) || seenTodos.has(todo.id)) continue;
+    seenTodos.add(todo.id);
+    if (!todosByTask.has(todo.taskId)) todosByTask.set(todo.taskId, []);
+    todosByTask.get(todo.taskId).push(todo);
+  }
+  const result = { nodeIds, taskCount: tasks.length, total: 0, done: 0, doing: 0, blocked: 0, todo: 0, deferred: 0, dropped: 0, historical: 0, closed: 0, pct: 0 };
+  // 有待办的任务只统计待办；没有待办的任务本身就是末级工作项。
+  for (const task of tasks) for (const row of todosByTask.get(task.id) || [task]) {
+    const status = row.status === 'active' ? 'doing' : row.status;
+    const key = ['done', 'doing', 'blocked', 'todo', 'deferred', 'dropped', 'historical'].includes(status) ? status : 'todo';
+    result[key] += 1;
+    result.total += 1;
+  }
+  result.closed = result.done + result.dropped + result.historical;
+  result.pct = result.total ? Math.round(result.closed * 100 / result.total) : 0;
+  return result;
+}
+
+function pbShortSummary(text, max = 120) {
+  const limit = Number.isFinite(max) ? Math.max(0, Math.trunc(max)) : 120;
+  const value = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  if (value.length <= limit) return value;
+  return limit > 1 ? value.slice(0, limit - 1) + '…' : limit ? '…' : '';
+}
+
 // Board schema, normalisation, and command validation for dsh-project-board.
 // The board file lives at <workspace>/board/project-board.json and is owned by
 // this plugin; workspace project files are never mutated.
+
 
 const BOARD_VERSION = 1;
 const BOARD_RELATIVE_PATH = 'board/project-board.json';
@@ -13,8 +71,8 @@ const BOARD_RELATIVE_PATH = 'board/project-board.json';
 const NODE_KINDS = new Set(['theme', 'milestone', 'component', 'document', 'experiment', 'figure', 'manuscript', 'infra', 'historical']);
 const NODE_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'active', 'deferred', 'historical']);
 const EDGE_KINDS = new Set(['contains', 'depends', 'produces']);
-const TASK_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'dropped']);
-const TODO_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'dropped']);
+const TASK_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'deferred', 'dropped', 'historical']);
+const TODO_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'deferred', 'dropped', 'historical']);
 const DECISION_STATUSES = new Set(['open', 'answered']);
 
 const LIMITS = {
@@ -25,6 +83,8 @@ const LIMITS = {
   decisions: 120,
   notes: 400,
   applied: 40,
+  changes: 80,
+  changeBytes: 2 * 1024 * 1024,
   threads: 20,
   id: 120,
   title: 300,
@@ -167,6 +227,16 @@ function normalizeEdge(raw, now) {
   };
 }
 
+function normalizeDelivery(raw) {
+  const value = isObject(raw) ? raw : {};
+  return {
+    summary: asString(value.summary, LIMITS.description),
+    outcome: ['unspecified', 'supported', 'not_supported', 'not_triggered', 'inconclusive'].includes(value.outcome) ? value.outcome : 'unspecified',
+    review: ['none', 'pending', 'accepted', 'changes_requested'].includes(value.review) ? value.review : 'none',
+    submittedAt: asIso(value.submittedAt, ''),
+  };
+}
+
 function normalizeTask(raw, now) {
   if (!isObject(raw)) return null;
   const nodeId = asString(raw.nodeId, LIMITS.id);
@@ -178,6 +248,8 @@ function normalizeTask(raw, now) {
     status: TASK_STATUSES.has(raw.status) ? raw.status : 'todo',
     owner: asString(raw.owner, LIMITS.short),
     acceptance: asString(raw.acceptance, LIMITS.description),
+    delivery: normalizeDelivery(raw.delivery),
+    primaryArtifactPath: asString(raw.primaryArtifactPath, LIMITS.path),
     blockedBy: Array.isArray(raw.blockedBy) ? [...new Set(raw.blockedBy.map((v) => asString(v, LIMITS.id)).filter(Boolean))].slice(0, 40) : [],
     writeScopes: Array.isArray(raw.writeScopes) ? [...new Set(raw.writeScopes.map((v) => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 20) : [],
     artifacts: normalizeArtifacts(raw.artifacts),
@@ -224,6 +296,8 @@ function normalizeTodo(raw, now) {
     status: TODO_STATUSES.has(raw.status) ? raw.status : 'todo',
     owner: asString(raw.owner, LIMITS.short),
     acceptance: asString(raw.acceptance, LIMITS.description),
+    delivery: normalizeDelivery(raw.delivery),
+    primaryArtifactPath: asString(raw.primaryArtifactPath, LIMITS.path),
     order: Number.isFinite(raw.order) ? Math.trunc(raw.order) : 0,
     threads,
     team: normalizeTeam(raw.team, now),
@@ -260,6 +334,48 @@ function normalizeNote(raw, now) {
     author: asString(raw.author, LIMITS.short, 'user'),
     createdAt: asIso(raw.createdAt, now),
   };
+}
+
+const CHANGE_COLLECTIONS = new Set(['nodes', 'edges', 'tasks', 'todos', 'notes', 'decisions']);
+
+function normalizeChanges(input, now) {
+  const rows = [], seen = new Set();
+  let bytes = 0;
+  for (const raw of Array.isArray(input) ? input : []) {
+    if (!isObject(raw) || !ID_RE.test(raw.id || '') || seen.has(raw.id)) continue;
+    const patches = Array.isArray(raw.patches) ? raw.patches : [];
+    const guards = Array.isArray(raw.guards) ? raw.guards : [];
+    const validPatch = patch => isObject(patch) && CHANGE_COLLECTIONS.has(patch.collection) && ID_RE.test(patch.id || '') &&
+      Array.isArray(patch.path) && patch.path.length <= 2 && patch.path.every(key => typeof key === 'string' && !['__proto__', 'prototype', 'constructor', 'id'].includes(key)) &&
+      (patch.path.length === 0 || (typeof patch.rowCreatedAt === 'string' && Number.isFinite(Date.parse(patch.rowCreatedAt)))) &&
+      typeof patch.beforeExists === 'boolean' && typeof patch.afterExists === 'boolean' &&
+      (!patch.beforeExists || Object.hasOwn(patch, 'before')) && (!patch.afterExists || Object.hasOwn(patch, 'after'));
+    const validGuard = guard => isObject(guard) && CHANGE_COLLECTIONS.has(guard.collection) && ID_RE.test(guard.id || '') && Array.isArray(guard.relations) && guard.relations.every(value => typeof value === 'string') &&
+      (guard.parents === undefined || (Array.isArray(guard.parents) && guard.parents.every(parent => isObject(parent) && CHANGE_COLLECTIONS.has(parent.collection) && ID_RE.test(parent.id || '') && typeof parent.createdAt === 'string' && Number.isFinite(Date.parse(parent.createdAt)))));
+    const valid = patches.length > 0 && patches.every(validPatch) && guards.every(validGuard);
+    const undo = isObject(raw.undo) ? raw.undo : {};
+    const row = {
+      id: raw.id, at: asIso(raw.at, now), actor: asString(raw.actor, 200, 'system'),
+      action: asString(raw.action, 80), summary: asString(raw.summary, LIMITS.short),
+      targets: (Array.isArray(raw.targets) ? raw.targets : []).filter(target => isObject(target) && ['node', 'edge', 'task', 'todo', 'note', 'decision', 'board'].includes(target.type)).map(target => ({ type: target.type, id: asString(target.id, LIMITS.id), title: asString(target.title, LIMITS.title) })),
+      undo: {
+        status: undo.status === 'undone' ? 'undone' : undo.status === 'available' && valid ? 'available' : 'unavailable',
+        reason: asString(undo.reason, LIMITS.short), undoneAt: asIso(undo.undoneAt, ''), undoneBy: asString(undo.undoneBy, 200),
+      },
+      patches: valid ? patches : [], guards: valid ? guards : [],
+    };
+    let size = new TextEncoder().encode(JSON.stringify(row)).length;
+    if (size > LIMITS.changeBytes / 2) {
+      row.patches = []; row.guards = [];
+      row.undo = { ...row.undo, status: 'unavailable', reason: '变更过大，仅保留摘要，无法撤销' };
+      row.targets = row.targets.slice(0, 20);
+      size = new TextEncoder().encode(JSON.stringify(row)).length;
+    }
+    if (bytes + size > LIMITS.changeBytes) break;
+    bytes += size; seen.add(row.id); rows.push(row);
+    if (rows.length >= LIMITS.changes) break;
+  }
+  return rows;
 }
 
 /** Coerce any loaded value into a valid board; never throws on untrusted input. */
@@ -316,7 +432,7 @@ function normalizeBoard(raw, options = {}) {
   const applied = [];
   for (const row of Array.isArray(source.applied) ? source.applied : []) {
     if (!isObject(row) || typeof row.id !== 'string' || !row.id) continue;
-    applied.push({ id: row.id.slice(0, 120), revision: Math.max(1, Math.trunc(Number(row.revision) || 1)), at: asIso(row.at, now) });
+    applied.push({ id: row.id.slice(0, 120), revision: Math.max(1, Math.trunc(Number(row.revision) || 1)), at: asIso(row.at, now), ...(row.changeId ? { changeId: asString(row.changeId, LIMITS.id) } : {}) });
     if (applied.length >= LIMITS.applied) break;
   }
   const assistant = isObject(source.assistant) && typeof source.assistant.sessionId === 'string' && source.assistant.sessionId
@@ -341,6 +457,7 @@ function normalizeBoard(raw, options = {}) {
     decisions,
     notes,
     applied,
+    changes: normalizeChanges(source.changes, now),
     ...(assistant ? { assistant } : {}),
   };
 }
@@ -355,21 +472,7 @@ function boardDigest(board, { workspacePath, teamTasks, sessionId } = {}) {
   if (!board) return '';
   const byId = new Map(board.nodes.map((n) => [n.id, n]));
   const tasksById = new Map(board.tasks.map((task) => [task.id, task]));
-  const tasksByNode = new Map();
-  for (const task of board.tasks) {
-    if (!tasksByNode.has(task.nodeId)) tasksByNode.set(task.nodeId, []);
-    tasksByNode.get(task.nodeId).push(task);
-  }
-  const statusCount = (rows) => {
-    const count = { todo: 0, doing: 0, blocked: 0, done: 0 };
-    for (const row of rows) {
-      if (row.status === 'doing' || row.status === 'active') count.doing += 1;
-      else if (row.status === 'blocked' || row.status === 'deferred') count.blocked += 1;
-      else if (row.status === 'done' || row.status === 'historical') count.done += 1;
-      else count.todo += 1;
-    }
-    return `${count.doing} 进行 / ${count.blocked} 受阻 / ${count.done} 完成 / ${count.todo} 待办`;
-  };
+  const statusCount = (stats) => `${stats.doing} 进行 / ${stats.blocked} 受阻 / ${stats.done} 完成 / ${stats.todo} 待办 / ${stats.deferred} 暂缓 / ${stats.dropped} 放弃 / ${stats.historical} 历史；已结束 ${stats.closed}/${stats.total}（${stats.pct}%）`;
   const lines = [];
   // 同一会话可绑定多个任务和待办；优先显示全部匹配，避免只识别首个待办。
   const inSession = (row) => sessionId && (row.threads || []).some((thread) => thread.sessionId === sessionId);
@@ -388,28 +491,32 @@ function boardDigest(board, { workspacePath, teamTasks, sessionId } = {}) {
     }
     lines.push('按实际进展用 project_board_update 更新对应任务/待办状态；绑定会话本身不代表开始或完成。');
   }
-  lines.push(`项目看板（workspace: ${workspacePath}，revision ${board.revision}，更新 ${new Date(board.updatedAt).toISOString()}）`);
+  lines.push(`项目看板（workspace: ${pbShortSummary(workspacePath || board.workspacePath || board.title, 180)}，revision ${board.revision}，更新 ${new Date(board.updatedAt).toISOString()}）`);
   const threadedTasks = board.tasks.filter((task) => task.threads?.length);
   const threadedTodos = board.todos.filter((todo) => todo.threads?.length);
   if (threadedTasks.length || threadedTodos.length) {
     const sessions = new Set([...threadedTasks, ...threadedTodos].flatMap((row) => row.threads.map((thread) => thread.sessionId)));
     lines.push(`- 已绑定会话：${threadedTasks.length} 个任务 / ${threadedTodos.length} 个待办，共 ${sessions.size} 个会话`);
   }
+  lines.push(`- 全板末级工作项：${statusCount(pbScopeStats(board))}`);
   const themes = board.nodes.filter((n) => n.kind === 'theme');
-  const others = board.nodes.filter((n) => n.kind !== 'theme');
-  for (const theme of themes) {
-    const children = board.edges.filter((e) => e.kind === 'contains' && e.from === theme.id).map((e) => byId.get(e.to)).filter(Boolean);
-    const tasks = children.flatMap((child) => tasksByNode.get(child.id) || []);
-    lines.push(`- ${theme.title}（${children.length} 节点；${statusCount(tasks)}）`);
-    for (const child of children.slice(0, 8)) {
-      const rows = tasksByNode.get(child.id) || [];
-      lines.push(`  · ${child.title}${rows.length ? ` — ${statusCount(rows)}` : ''}`);
-    }
-    if (children.length > 8) lines.push(`  · …共 ${children.length} 个节点`);
-  }
-  const looseNodes = others.filter((node) => !board.edges.some((e) => e.kind === 'contains' && e.to === node.id));
+  const assigned = new Set(themes.flatMap(theme => pbNodeIdsInScope(board, theme.id)));
+  const looseNodes = board.nodes.filter(node => !assigned.has(node.id));
   if (looseNodes.length) {
-    lines.push(`- 其他节点：${looseNodes.slice(0, 10).map((n) => `${n.title}(${n.status})`).join('、')}${looseNodes.length > 10 ? ` 等 ${looseNodes.length} 个` : ''}`);
+    const looseIds = new Set(looseNodes.map(node => node.id));
+    const looseBoard = { ...board, nodes: looseNodes, tasks: board.tasks.filter(task => looseIds.has(task.nodeId)) };
+    lines.push(`- 未归属主题：${looseNodes.length} 节点；${statusCount(pbScopeStats(looseBoard))}`);
+    lines.push(`  · ${looseNodes.slice(0, 10).map(node => `${pbShortSummary(node.title, 45)}(${node.status})`).join('、')}${looseNodes.length > 10 ? ` 等 ${looseNodes.length} 个` : ''}`);
+  }
+  for (const theme of themes) {
+    const stats = pbScopeStats(board, theme.id);
+    const children = stats.nodeIds.filter(id => id !== theme.id).map(id => byId.get(id));
+    lines.push(`- ${pbShortSummary(theme.title, 70)}（含自身 ${stats.nodeIds.length} 节点；${statusCount(stats)}）`);
+    for (const child of children.slice(0, 8)) {
+      const childStats = pbScopeStats(board, child.id);
+      lines.push(`  · ${pbShortSummary(child.title, 70)}${childStats.taskCount ? ` — ${statusCount(childStats)}` : ''}`);
+    }
+    if (children.length > 8) lines.push(`  · …共 ${children.length} 个后代节点`);
   }
   const doing = board.todos.filter((t) => t.status === 'doing' || t.status === 'active');
   if (doing.length) {
@@ -424,14 +531,29 @@ function boardDigest(board, { workspacePath, teamTasks, sessionId } = {}) {
   }
   const open = board.decisions.filter((d) => d.status === 'open');
   if (open.length) {
-    lines.push(`- 待决策：${open.slice(0, 4).map((d) => d.question).join('；')}${open.length > 4 ? ` 等 ${open.length} 条` : ''}`);
+    lines.push(`- 待决策：${open.slice(0, 4).map((d) => pbShortSummary(d.question, 140)).join('；')}${open.length > 4 ? ` 等 ${open.length} 条` : ''}`);
   }
   const boardNotes = board.notes.filter((n) => n.targetType === 'board');
   if (boardNotes.length) {
-    lines.push(`- 最新备注：${boardNotes.slice(-2).map((n) => n.text.split('\n')[0]).join(' / ')}`);
+    lines.push(`- 最新备注摘要：${boardNotes.slice(-2).map((n) => pbShortSummary(n.text)).join(' / ')}（正文保留在看板）`);
   }
-  lines.push('约定：规划、汇报项目状态前先读看板；工作完成后用 project_board_update 回写节点/任务/待办状态；不要另建状态文件。');
-  return lines.join('\n').slice(0, 4000);
+  const convention = '约定：规划、汇报项目状态前先读看板；工作完成后用 project_board_update 回写节点/任务/待办状态；不要另建状态文件。';
+  const omission = '（部分条目省略；完整内容请读取看板。）';
+  // 给总数、未归属条目、决策、最新结论和约定留足预算，逐行省略其余内容。
+  const fixed = new Set(lines.filter(line => /^(项目看板|\- 全板末级|\- 未归属主题|\- 待决策|\- 最新备注摘要)/.test(line)));
+  const fixedSize = [...fixed].reduce((sum, line) => sum + line.length + 1, 0);
+  const selected = [], budget = 4000 - convention.length - omission.length - fixedSize - 3;
+  let used = 0, omitted = false;
+  for (const line of lines) {
+    if (!fixed.has(line)) {
+      if (used + line.length + 1 > budget) { omitted = true; continue; }
+      used += line.length + 1;
+    }
+    selected.push(line);
+  }
+  if (omitted) selected.push(omission);
+  selected.push(convention);
+  return selected.join('\n');
 }
 
 /** Build a compact transcript entry from raw session events (filled by thread.mjs). */
@@ -543,6 +665,8 @@ function defaultBoard(workspacePath, title) {
 
 
 
+
+
 const ACTIONS = new Set([
   'create_board', 'rename_board',
   'upsert_node', 'delete_node',
@@ -553,6 +677,7 @@ const ACTIONS = new Set([
   'add_note', 'delete_note',
   'upsert_decision', 'delete_decision',
   'bind_thread', 'unbind_thread', 'bind_assistant', 'unbind_assistant',
+  'undo_change',
 ]);
 
 function isoNow() {
@@ -609,6 +734,176 @@ function findThreadTarget(board, body) {
 function nextOrder(rows, taskId) {
   const scoped = rows.filter((row) => row.taskId === taskId);
   return scoped.length ? Math.max(...scoped.map((row) => row.order || 0)) + 1 : 0;
+}
+
+const HISTORY_COLLECTIONS = ['nodes', 'edges', 'tasks', 'todos', 'notes', 'decisions'];
+const HISTORY_TYPES = { nodes: 'node', edges: 'edge', tasks: 'task', todos: 'todo', notes: 'note', decisions: 'decision' };
+const UNDO_ACTIONS = new Set(['save_positions', 'upsert_node', 'delete_node', 'upsert_edge', 'delete_edge', 'upsert_task', 'delete_task', 'upsert_todo', 'delete_todo', 'move_todo', 'add_note', 'delete_note', 'upsert_decision', 'delete_decision']);
+const ACTION_LABELS = { save_positions: '调整节点位置', upsert_node: '编辑节点', delete_node: '删除节点', upsert_edge: '编辑连线', delete_edge: '删除连线', upsert_task: '编辑任务', delete_task: '删除任务', upsert_todo: '编辑待办', delete_todo: '删除待办', move_todo: '调整待办顺序', add_note: '添加备注', delete_note: '删除备注', upsert_decision: '编辑决策', delete_decision: '删除决策', bind_thread: '绑定会话', unbind_thread: '解绑会话', bind_assistant: '绑定看板助手', unbind_assistant: '解绑看板助手', rename_board: '重命名看板', dispatch: '派发团队任务', undo_change: '撤销变更' };
+const plain = value => JSON.parse(JSON.stringify(value));
+
+// 仅记录变动的字段；时间戳是副作用，不阻挡同条目其他字段的独立编辑。
+function historyPatches(before, after) {
+  const patches = [];
+  for (const collection of HISTORY_COLLECTIONS) {
+    const oldRows = new Map(before[collection].map(row => [row.id, row]));
+    const newRows = new Map(after[collection].map(row => [row.id, row]));
+    for (const id of new Set([...oldRows.keys(), ...newRows.keys()])) {
+      const previous = oldRows.get(id), current = newRows.get(id);
+      const add = (path, oldValue, newValue, beforeExists, afterExists) => patches.push({ collection, id, path, beforeExists, afterExists, ...(path.length ? { rowCreatedAt: current.createdAt } : {}), ...(beforeExists ? { before: oldValue } : {}), ...(afterExists ? { after: newValue } : {}) });
+      if (!previous || !current) {
+        add([], previous, current, Boolean(previous), Boolean(current));
+        patches[patches.length - 1].index = (previous ? before : after)[collection].findIndex(row => row.id === id);
+        continue;
+      }
+      for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+        if (key === 'updatedAt' || isDeepStrictEqual(previous[key], current[key])) continue;
+        if (key === 'delivery' && previous.delivery && current.delivery) {
+          for (const field of new Set([...Object.keys(previous.delivery), ...Object.keys(current.delivery)])) {
+            if (!isDeepStrictEqual(previous.delivery[field], current.delivery[field])) add([key, field], previous.delivery[field], current.delivery[field], Object.hasOwn(previous.delivery, field), Object.hasOwn(current.delivery, field));
+          }
+        } else add([key], previous[key], current[key], Object.hasOwn(previous, key), Object.hasOwn(current, key));
+      }
+    }
+  }
+  return patches;
+}
+
+// 新建/删除整个条目时还需锁定关联成员，防止撤销连带丢失后来新增的工作。
+function historyRelations(board, collection, id) {
+  const relations = [];
+  const add = (name, row, field) => relations.push(`${name}:${row.id}:${field}`);
+  if (collection === 'nodes') {
+    for (const row of board.edges) if (row.from === id || row.to === id) add('edges', row, row.from === id ? 'from' : 'to');
+    for (const row of board.tasks) if (row.nodeId === id) add('tasks', row, 'nodeId');
+    for (const row of board.decisions) if (row.nodeId === id) add('decisions', row, 'nodeId');
+  }
+  if (collection === 'tasks') {
+    for (const row of board.todos) if (row.taskId === id) add('todos', row, 'taskId');
+    for (const row of board.tasks) if (row.blockedBy.includes(id)) add('tasks', row, 'blockedBy');
+  }
+  const type = HISTORY_TYPES[collection];
+  for (const row of board.notes) if (row.targetType === type && row.targetId === id) add('notes', row, 'targetId');
+  return relations.sort();
+}
+
+function historyTargets(before, after, patches) {
+  const targets = new Map();
+  const oldRows = Object.fromEntries(HISTORY_COLLECTIONS.map(name => [name, new Map(before[name].map(row => [row.id, row]))]));
+  const rows = Object.fromEntries(HISTORY_COLLECTIONS.map(name => [name, new Map([...before[name], ...after[name]].map(row => [row.id, row]))]));
+  const parents = new Map();
+  for (const edge of [...before.edges, ...after.edges]) if (edge.kind === 'contains') {
+    if (!parents.has(edge.to)) parents.set(edge.to, new Set());
+    parents.get(edge.to).add(edge.from);
+  }
+  const add = (collection, id) => {
+    const type = HISTORY_TYPES[collection], key = `${type}:${id}`;
+    if (!type || !id || targets.has(key)) return;
+    const row = rows[collection].get(id);
+    targets.set(key, { type, id, title: pbShortSummary(row?.title || row?.label || row?.question || row?.text || id, 120) });
+    if (collection === 'nodes') for (const parent of parents.get(id) || []) add('nodes', parent);
+    for (const version of [oldRows[collection].get(id), row].filter(Boolean)) {
+      if (version.nodeId) add('nodes', version.nodeId);
+      if (version.taskId && collection === 'todos') add('tasks', version.taskId);
+      if (collection === 'edges') { add('nodes', version.from); add('nodes', version.to); }
+      if (collection === 'notes') add(Object.keys(HISTORY_TYPES).find(name => HISTORY_TYPES[name] === version.targetType), version.targetId);
+    }
+  };
+  for (const patch of patches) add(patch.collection, patch.id);
+  return [...targets.values()];
+}
+
+function historyGuard(before, after, patch) {
+  const parents = new Map();
+  const remember = (collection, id) => {
+    const row = after[collection]?.find(item => item.id === id);
+    if (row) parents.set(`${collection}:${id}`, { collection, id, createdAt: row.createdAt });
+  };
+  for (const board of [before, after]) {
+    const row = board[patch.collection].find(item => item.id === patch.id);
+    if (!row) continue;
+    if (row.nodeId) remember('nodes', row.nodeId);
+    if (patch.collection === 'todos') remember('tasks', row.taskId);
+    if (patch.collection === 'edges') { remember('nodes', row.from); remember('nodes', row.to); }
+    if (patch.collection === 'tasks') for (const id of row.blockedBy) remember('tasks', id);
+    if (patch.collection === 'notes') remember(Object.keys(HISTORY_TYPES).find(name => HISTORY_TYPES[name] === row.targetType), row.targetId);
+  }
+  return { collection: patch.collection, id: patch.id, checkRelations: patch.path.length === 0, relations: patch.path.length === 0 ? historyRelations(after, patch.collection, patch.id) : [], parents: [...parents.values()] };
+}
+
+function makeHistory(before, after, action, actor, patches = historyPatches(before, after)) {
+  const targets = historyTargets(before, after, patches);
+  const external = patches.some(patch => ['team', 'threads'].includes(patch.path[0]) || (patch.path.length === 0 && !patch.beforeExists && (patch.after?.team || patch.after?.threads?.length)));
+  const available = UNDO_ACTIONS.has(action) && patches.length > 0 && !external;
+  return {
+    id: newId('change'), at: isoNow(), actor, action,
+    summary: `${ACTION_LABELS[action] || action}${targets.length ? `：${targets[0].title}` : ''}${new Set(patches.map(patch => `${patch.collection}:${patch.id}`)).size > 1 ? '（含关联条目）' : ''}`,
+    targets,
+    undo: { status: available ? 'available' : 'unavailable', reason: available ? '' : external ? '会话或团队关联变更不支持撤销' : patches.length ? '此操作不支持撤销' : '没有可撤销的字段变动', undoneAt: '', undoneBy: '' },
+    patches: available ? patches : [],
+    guards: available ? [...new Map(patches.map(patch => [`${patch.collection}:${patch.id}`, historyGuard(before, after, patch)])).values()] : [],
+  };
+}
+
+function invalidRelations(board) {
+  const invalid = new Set(), nodes = new Set(board.nodes.map(row => row.id)), tasks = new Set(board.tasks.map(row => row.id)), todos = new Set(board.todos.map(row => row.id));
+  for (const row of board.edges) for (const field of ['from', 'to']) if (!nodes.has(row[field])) invalid.add(`edge:${row.id}:${field}:${row[field]}`);
+  for (const row of board.tasks) {
+    if (!nodes.has(row.nodeId)) invalid.add(`task:${row.id}:nodeId:${row.nodeId}`);
+    for (const id of row.blockedBy) if (!tasks.has(id)) invalid.add(`task:${row.id}:blockedBy:${id}`);
+  }
+  for (const row of board.todos) if (!tasks.has(row.taskId)) invalid.add(`todo:${row.id}:taskId:${row.taskId}`);
+  for (const row of board.decisions) if (row.nodeId && !nodes.has(row.nodeId)) invalid.add(`decision:${row.id}:${row.nodeId}`);
+  for (const row of board.notes) {
+    const known = { node: nodes, task: tasks, todo: todos }[row.targetType];
+    if (known && !known.has(row.targetId)) invalid.add(`note:${row.id}:${row.targetType}:${row.targetId}`);
+  }
+  return invalid;
+}
+
+function undoHistory(board, changeId, actor) {
+  const change = board.changes.find(row => row.id === changeId);
+  if (!change) throw new BoardError('CHANGE_NOT_FOUND', '变更记录不存在或已超出保留范围', 404);
+  if (change.undo.status !== 'available') throw new BoardError('UNDO_UNAVAILABLE', change.undo.status === 'undone' ? '这条变更已撤销' : change.undo.reason || '这条变更不可撤销', 409);
+  const conflict = () => { throw new BoardError('UNDO_CONFLICT', '受影响字段或关联已被更新，无法安全撤销；请刷新后查看当前内容', 409, { changeId }); };
+  for (const patch of change.patches) {
+    const row = board[patch.collection].find(item => item.id === patch.id);
+    if (patch.path.length && row?.createdAt !== patch.rowCreatedAt) conflict();
+    let parent = row;
+    for (const key of patch.path.slice(0, -1)) parent = parent?.[key];
+    const key = patch.path.at(-1), exists = patch.path.length ? Boolean(parent && Object.hasOwn(parent, key)) : Boolean(row);
+    const value = patch.path.length ? parent?.[key] : row;
+    if (exists !== patch.afterExists || (exists && !isDeepStrictEqual(plain(value), patch.after))) conflict();
+  }
+  for (const guard of change.guards) {
+    if (guard.checkRelations !== false && !isDeepStrictEqual(historyRelations(board, guard.collection, guard.id), guard.relations)) conflict();
+    for (const parent of guard.parents || []) if (board[parent.collection].find(row => row.id === parent.id)?.createdAt !== parent.createdAt) conflict();
+  }
+  const candidate = plain(board), now = isoNow();
+  for (const patch of [...change.patches].reverse()) {
+    const rows = candidate[patch.collection], index = rows.findIndex(row => row.id === patch.id);
+    if (patch.path.length === 0) {
+      if (patch.beforeExists) {
+        if (index >= 0) rows[index] = plain(patch.before);
+        else rows.splice(Math.max(0, Math.min(rows.length, patch.index || 0)), 0, plain(patch.before));
+      } else if (index >= 0) rows.splice(index, 1);
+    } else {
+      if (index < 0) conflict();
+      let parent = rows[index];
+      for (const key of patch.path.slice(0, -1)) parent = parent[key];
+      const key = patch.path.at(-1);
+      if (patch.beforeExists) parent[key] = plain(patch.before); else delete parent[key];
+      if (Object.hasOwn(rows[index], 'updatedAt')) rows[index].updatedAt = now;
+    }
+  }
+  // 只拒绝本次撤销新产生的悬空关系；既有无关历史数据不成为全局锁。
+  const previousInvalid = invalidRelations(board);
+  for (const issue of invalidRelations(candidate)) if (!previousInvalid.has(issue)) conflict();
+  const normalized = normalizeBoard(candidate);
+  for (const collection of HISTORY_COLLECTIONS) if (normalized[collection].length !== candidate[collection].length) conflict();
+  for (const collection of HISTORY_COLLECTIONS) board[collection] = candidate[collection];
+  change.undo = { status: 'undone', reason: '', undoneAt: now, undoneBy: actor };
+  return change;
 }
 
 class BoardService {
@@ -711,31 +1006,39 @@ class BoardService {
         return { board, workspace, created: true };
       }
       const board = current.board;
-      if (commandId && board.applied.some((row) => row.id === commandId)) {
-        return { board, workspace, replayed: true };
+      const applied = commandId && board.applied.find((row) => row.id === commandId);
+      if (applied) {
+        const lastChange = board.changes.find(row => row.id === applied.changeId);
+        return { board, workspace, replayed: true, changeId: applied.changeId, lastChange };
       }
       if (expected !== null && expected !== board.revision) {
         throw new BoardError('STALE_REVISION', `看板已被更新（当前 revision ${board.revision}，提交 ${expected}），请重载后再试`, 409, { revision: board.revision });
       }
+      const before = plain(board);
       this.applyCommand(board, action, body, actor);
       board.revision += 1;
       board.updatedAt = isoNow();
       board.updatedBy = actor;
-      if (commandId) {
-        board.applied.unshift({ id: commandId, revision: board.revision, at: board.updatedAt });
-        board.applied = board.applied.slice(0, LIMITS.applied);
-      }
       const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
-      await this.store.write(workspace.path, normalized);
-      this.cache.set(workspace.path, { mtimeMs: Date.now(), board: normalized });
-      this.store.notify({ workspacePath: workspace.path, board: normalized, actor });
-      return { board: normalized, workspace };
+      const change = makeHistory(before, plain(normalized), action, actor);
+      if (action === 'undo_change') change.summary = `撤销：${before.changes.find(row => row.id === body.changeId)?.summary || body.changeId}`;
+      normalized.changes.unshift(change);
+      if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
+      const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
+      await this.store.write(workspace.path, committed);
+      this.cache.set(workspace.path, { mtimeMs: Date.now(), board: committed });
+      this.store.notify({ workspacePath: workspace.path, board: committed, actor });
+      return { board: committed, workspace, changeId: change.id, lastChange: committed.changes[0] };
     });
   }
 
   applyCommand(board, action, body, actor) {
     const now = isoNow();
     switch (action) {
+      case 'undo_change': {
+        undoHistory(board, asString(body.changeId, LIMITS.id), actor);
+        return;
+      }
       case 'create_board':
       case 'rename_board': {
         if (action === 'rename_board') board.title = asString(body.title, LIMITS.title, board.title);
@@ -796,7 +1099,8 @@ class BoardService {
         const merged = { ...existing, ...task };
         findNode(board, asString(merged.nodeId, LIMITS.id));
         if (existing) {
-          Object.assign(existing, task, { updatedAt: now });
+          const delivery = Object.hasOwn(task, 'delivery') ? { ...existing.delivery, ...requireObject(task.delivery, 'delivery') } : existing.delivery;
+          Object.assign(existing, task, { delivery, updatedAt: now });
         } else {
           const created = normalizeBoard({ ...board, tasks: [...board.tasks, { ...task, createdAt: now, updatedAt: now }] });
           board.tasks = created.tasks;
@@ -816,7 +1120,8 @@ class BoardService {
         const normalizedTaskId = asString(merged.taskId, LIMITS.id);
         findTask(board, normalizedTaskId);
         if (existing) {
-          Object.assign(existing, todo, { updatedAt: now });
+          const delivery = Object.hasOwn(todo, 'delivery') ? { ...existing.delivery, ...requireObject(todo.delivery, 'delivery') } : existing.delivery;
+          Object.assign(existing, todo, { delivery, updatedAt: now });
         } else {
           const created = normalizeBoard({
             ...board,
@@ -979,6 +1284,7 @@ class BoardService {
         throw new BoardError('STALE_REVISION', `看板已被更新（当前 revision ${board.revision}）`, 409, { revision: board.revision });
       }
       if (commandId && board.applied.some((row) => row.id === commandId)) return { board, workspace, replayed: true, created: [] };
+      const before = plain(board);
       const created = [];
       for (const item of requested) {
         if (!item || typeof item !== 'object') continue;
@@ -1042,14 +1348,15 @@ class BoardService {
       board.revision += 1;
       board.updatedAt = isoNow();
       board.updatedBy = actor;
-      if (commandId) {
-        board.applied.unshift({ id: commandId, revision: board.revision, at: board.updatedAt });
-        board.applied = board.applied.slice(0, LIMITS.applied);
-      }
       const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
-      await this.store.write(workspace.path, normalized);
-      this.store.notify({ workspacePath: workspace.path, board: normalized, actor });
-      return { board: normalized, workspace, created };
+      const change = makeHistory(before, plain(normalized), 'dispatch', actor);
+      change.undo.reason = '团队派发会创建外部任务，不支持撤销';
+      normalized.changes.unshift(change);
+      if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
+      const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
+      await this.store.write(workspace.path, committed);
+      this.store.notify({ workspacePath: workspace.path, board: committed, actor });
+      return { board: committed, workspace, created, changeId: change.id, lastChange: committed.changes[0] };
     });
   }
 }
@@ -1274,7 +1581,7 @@ async function apply(ctx) {
       input: body.input,
       actor: typeof body.actor === 'string' ? body.actor : 'user',
     });
-    return jsonResponse(200, { board: result.board, workspace: result.workspace, replayed: Boolean(result.replayed) });
+    return jsonResponse(200, { board: result.board, workspace: result.workspace, replayed: Boolean(result.replayed), changeId: result.changeId, lastChange: result.lastChange });
   }]);
 
   routes.push(['POST', '/api/project-board/dispatch', async (request) => {
@@ -1287,7 +1594,7 @@ async function apply(ctx) {
       items: body.items,
       actor: typeof body.actor === 'string' ? body.actor : 'user',
     });
-    return jsonResponse(200, { board: result.board, created: result.created });
+    return jsonResponse(200, { board: result.board, created: result.created, changeId: result.changeId, lastChange: result.lastChange });
   }]);
 
   routes.push(['GET', '/api/project-board/thread', async (request) => {
@@ -1480,11 +1787,11 @@ async function apply(ctx) {
         enum: [
           'create_board', 'rename_board', 'upsert_node', 'delete_node', 'upsert_edge', 'delete_edge',
           'upsert_task', 'delete_task', 'upsert_todo', 'delete_todo', 'move_todo', 'save_positions',
-          'add_note', 'delete_note', 'upsert_decision', 'delete_decision', 'bind_thread', 'unbind_thread',
+          'add_note', 'delete_note', 'upsert_decision', 'delete_decision', 'bind_thread', 'unbind_thread', 'undo_change',
         ],
         description: '看板操作类型',
       },
-      input: { type: 'json', description: '操作参数，例如 {node:{...}}、{id:"..."}、{positions:[{id,x,y}]}。bind_thread/unbind_thread 的 taskId 和 todoId 恰好提供一个，并提供 sessionId；绑定追加且幂等，不覆盖已有会话。仅旧 unbind_thread({todoId}) 可省略 sessionId 清空待办会话。upsert_task/upsert_todo 可保存 threads 数组。' },
+      input: { type: 'json', description: '操作参数，例如 {node:{...}}、{id:"..."}、{positions:[{id,x,y}]}。bind_thread/unbind_thread 的 taskId 和 todoId 恰好提供一个，并提供 sessionId；绑定追加且幂等，不覆盖已有会话。仅旧 unbind_thread({todoId}) 可省略 sessionId 清空待办会话。upsert_task/upsert_todo 可保存 threads、primaryArtifactPath，以及 delivery:{summary,outcome,review,submittedAt}；outcome 为 unspecified/supported/not_supported/not_triggered/inconclusive，review 为 none/pending/accepted/changes_requested。旧 acceptance 是验收要求，结论写 delivery。undo_change 用 {changeId} 撤销一条可撤销变更，遇到字段或关联冲突会拒绝。' },
     },
     output: {
       schema: { type: 'json' },
@@ -1503,7 +1810,7 @@ async function apply(ctx) {
         actor: `agent:${agent?.id || 'unknown'}`,
         allowCreate: args.action === 'create_board',
       });
-      return jsonSafe({ ok: true, action: args.action, revision: result.board.revision, workspacePath: workspace.path, board: result.board });
+      return jsonSafe({ ok: true, action: args.action, revision: result.board.revision, workspacePath: workspace.path, board: result.board, changeId: result.changeId, lastChange: result.lastChange });
     },
   })), 'project-board tool: update');
 

@@ -1,4 +1,165 @@
-// Inspector, task/todo editing, artifacts, notes, and the todo conversation drawer.
+// 节点检查器、任务/待办交付、产物和变更历史。
+const PB_DELIVERY_OUTCOMES = { unspecified: '未填写', supported: '支持假设', not_supported: '未支持假设', not_triggered: '条件未触发', inconclusive: '尚无定论' };
+const PB_DELIVERY_REVIEWS = { none: '未提交', pending: '待验收', accepted: '已验收', changes_requested: '需修改' };
+
+function pbDeliveryValues(item) {
+  return { acceptance: item.acceptance || '', summary: item.delivery?.summary || '', outcome: item.delivery?.outcome || 'unspecified', review: item.delivery?.review || 'none', submittedAt: item.delivery?.submittedAt || '', primaryArtifactPath: item.primaryArtifactPath || '' };
+}
+
+// 只写显式改动的字段；旧验收文本不会复制到交付结论，服务端合并 delivery 子字段。
+function pbDeliveryPatch(previous, draft) {
+  const patch = {}, delivery = {};
+  for (const key of ['acceptance', 'primaryArtifactPath']) if (draft[key] !== previous[key]) patch[key] = draft[key];
+  for (const key of ['summary', 'outcome', 'review', 'submittedAt']) if (draft[key] !== previous[key]) delivery[key] = draft[key];
+  if (Object.keys(delivery).length) patch.delivery = delivery;
+  return patch;
+}
+
+function pbEditorError(error, fallback, retained = '草稿') {
+  const message = error?.message || fallback;
+  return /CONFLICT|STALE_REVISION/i.test(error?.code || '')
+    ? `版本冲突：${message}。${retained}已保留，请核对最新内容后重试。` : message;
+}
+
+function PbExpandableText({ text, empty = '', limit = 150 }) {
+  const original = String(text || '');
+  if (!original) return empty ? h('div', { className: 'pb-row-sub' }, empty) : null;
+  const firstLine = original.trim().split(/\r?\n/).find((line) => line.trim()) || '';
+  const brief = firstLine.length > limit ? firstLine.slice(0, limit) + '…' : firstLine;
+  return h('div', { className: 'pb-expandable-text' },
+    h('div', { className: 'pb-summary-brief' }, brief),
+    original !== brief ? h('details', { className: 'pb-original-text' },
+      h('summary', null, '展开完整原文'), h('div', { className: 'pb-full-text' }, original)) : null);
+}
+
+// 内部按记录挂载，调用者即使忘记 key，异步回调和草稿也不会进入另一条记录。
+function PbDeliveryEditor(props) {
+  return h(PbDeliveryEditorForm, { ...props, key: props.targetType + ':' + props.item.id });
+}
+
+function PbDeliveryEditorForm({ item, targetType, runCommand, onOpenArtifact }) {
+  const [draft, setDraft] = React.useState(() => pbDeliveryValues(item));
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const saved = React.useRef(pbDeliveryValues(item));
+  const pending = React.useRef(false), composing = React.useRef(false);
+  React.useEffect(() => {
+    const previous = saved.current, next = pbDeliveryValues(item);
+    saved.current = next;
+    setDraft((current) => Object.fromEntries(Object.keys(next).map((key) => [key, current[key] === previous[key] ? next[key] : current[key]])));
+  }, [item.acceptance, item.primaryArtifactPath, item.delivery?.summary, item.delivery?.outcome, item.delivery?.review, item.delivery?.submittedAt]);
+  const artifacts = (item.artifacts || []).filter((row, index, all) => row.path && all.findIndex((other) => other.path === row.path) === index);
+  const primary = artifacts.find((row) => row.path === item.primaryArtifactPath);
+  const dirty = Object.keys(pbDeliveryPatch(saved.current, draft)).length > 0;
+  const change = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
+
+  async function save(event, submitForReview = false) {
+    event.preventDefault();
+    if (pending.current || composing.current || event.nativeEvent?.isComposing) return;
+    const submitted = submitForReview ? { ...draft, review: 'pending', submittedAt: new Date().toISOString() } : { ...draft };
+    const patch = pbDeliveryPatch(saved.current, submitted);
+    if (!Object.keys(patch).length) return;
+    if (patch.primaryArtifactPath && !artifacts.some((row) => row.path === patch.primaryArtifactPath)) { setError('主成果已不在登记产物中，请重新选择或清除。'); return; }
+    if (submitForReview) setDraft(submitted);
+    pending.current = true; setSaving(true); setError('');
+    try {
+      const response = await runCommand(targetType === 'task' ? 'upsert_task' : 'upsert_todo', { [targetType]: { id: item.id, ...patch } }, { throwOnError: true });
+      if (!response) throw new Error('保存未成功，草稿已保留，请重试。');
+      const stored = response.board?.[targetType === 'task' ? 'tasks' : 'todos']?.find((row) => row.id === item.id);
+      const next = stored ? pbDeliveryValues(stored) : submitted;
+      saved.current = next;
+      setDraft((current) => Object.fromEntries(Object.keys(next).map((key) => [key, current[key] === submitted[key] ? next[key] : current[key]])));
+    } catch (err) { setError(pbEditorError(err, '保存失败，草稿已保留，请重试。')); }
+    finally { pending.current = false; setSaving(false); }
+  }
+
+  return h('section', { className: 'pb-delivery', 'data-delivery-target': targetType + ':' + item.id, onClick: (event) => event.stopPropagation() },
+    item.acceptance ? h('div', { className: 'pb-delivery-readout' }, h('span', { className: 'pb-field-caption' }, '验收标准'), h(PbExpandableText, { text: item.acceptance })) : null,
+    item.delivery?.summary ? h('div', { className: 'pb-delivery-readout' }, h('span', { className: 'pb-field-caption' }, '交付结论'), h(PbExpandableText, { text: item.delivery.summary })) : null,
+    h('div', { className: 'pb-delivery-meta' },
+      h('span', { className: 'pb-chip' }, '结果：' + (PB_DELIVERY_OUTCOMES[item.delivery?.outcome] || '未填写')),
+      h('span', { className: 'pb-chip' }, PB_DELIVERY_REVIEWS[item.delivery?.review] || '未提交'),
+      item.delivery?.submittedAt ? h('time', { dateTime: item.delivery.submittedAt, className: 'pb-row-sub', title: item.delivery.submittedAt }, '提交于 ' + pbFormatTime(item.delivery.submittedAt)) : null),
+    primary ? h('button', { type: 'button', className: 'pb-primary-artifact', disabled: !onOpenArtifact, 'data-artifact-path': primary.path, 'aria-haspopup': 'dialog', onClick: () => onOpenArtifact(primary) },
+      h('span', { className: 'pb-primary-label' }, '当前采用'), primary.label || primary.path) : null,
+    item.primaryArtifactPath && !primary ? h('div', { className: 'pb-row-sub' }, '原主成果已不在登记产物中：' + item.primaryArtifactPath) : null,
+    h('details', { className: 'pb-delivery-details' },
+      h('summary', null, '编辑验收与交付', dirty ? ' · 有未保存修改' : ''),
+      h('form', { className: 'pb-delivery-form', 'aria-busy': saving, onSubmit: save,
+        onCompositionStart: () => { composing.current = true; }, onCompositionEnd: () => { composing.current = false; },
+        onKeyDown: (event) => { if (event.key === 'Enter' && !pbIsSubmitKey(event)) event.preventDefault(); } },
+        h('label', null, '验收标准', h('textarea', { className: 'pb-input', 'aria-label': '验收标准', rows: 3, value: draft.acceptance, onChange: (event) => change('acceptance', event.target.value), placeholder: '交付需要满足的要求' })),
+        h('label', null, '交付结论', h('textarea', { className: 'pb-input', 'aria-label': '交付结论', rows: 3, value: draft.summary, onChange: (event) => change('summary', event.target.value), placeholder: '实际完成的工作、结论与限制' })),
+        h('div', { className: 'pb-delivery-selects' },
+          h('label', null, '结果标签', h('select', { className: 'pb-select', 'aria-label': '结果标签', value: draft.outcome, onChange: (event) => change('outcome', event.target.value) }, ...Object.entries(PB_DELIVERY_OUTCOMES).map(([value, label]) => h('option', { key: value, value }, label)))),
+          h('label', null, '验收状态', h('select', { className: 'pb-select', 'aria-label': '验收状态', value: draft.review, onChange: (event) => change('review', event.target.value) }, ...Object.entries(PB_DELIVERY_REVIEWS).map(([value, label]) => h('option', { key: value, value }, label))))),
+        h('label', null, '主成果', h('select', { className: 'pb-select', 'aria-label': '主成果', value: draft.primaryArtifactPath, onChange: (event) => change('primaryArtifactPath', event.target.value) },
+          h('option', { value: '' }, '未指定（可清除）'),
+          draft.primaryArtifactPath && !artifacts.some((row) => row.path === draft.primaryArtifactPath) ? h('option', { value: draft.primaryArtifactPath, disabled: true }, '已不在登记产物中：' + draft.primaryArtifactPath) : null,
+          ...artifacts.map((row) => h('option', { key: row.path, value: row.path }, row.label ? row.label + ' · ' + row.path : row.path)))),
+        h('div', { className: 'pb-delivery-meta' }, h('span', { className: 'pb-row-sub' }, draft.submittedAt ? '提交时间：' + pbFormatTime(draft.submittedAt) : '尚未记录提交时间'),
+          draft.submittedAt ? h('button', { type: 'button', className: 'pb-btn small', onClick: () => change('submittedAt', '') }, '清除提交时间') : null),
+        h('div', { className: 'pb-delivery-actions' },
+          h('button', { type: 'submit', className: 'pb-btn small', disabled: saving || !dirty }, saving ? '保存中…' : '保存交付信息'),
+          h('button', { type: 'button', className: 'pb-btn small', disabled: saving, onClick: (event) => save(event, true) }, '提交验收')))),
+    error ? h('div', { className: 'pb-form-error', role: 'alert' }, error) : null);
+}
+
+function PbNodeMembership({ board, node, parentCandidates = [], onReparentNode }) {
+  const parents = pbNodeBranchPath(board, node.id);
+  const [parentId, setParentId] = React.useState('');
+  const [saving, setSaving] = React.useState(false), [error, setError] = React.useState('');
+  const pending = React.useRef(false), composing = React.useRef(false);
+  const label = parents.length ? '所属分支：' + parents.map((parent) => parent.title).join(' / ') : node.kind === 'theme' ? '顶层项目分支' : '未归属';
+  async function submit(event) {
+    event.preventDefault();
+    if (pending.current || composing.current || !parentId || !onReparentNode) return;
+    if (!parentCandidates.some((row) => row.id === parentId)) { setError('所选归属已不可用，请重新选择。'); return; }
+    const submitted = parentId;
+    pending.current = true; setSaving(true); setError('');
+    try {
+      const response = await onReparentNode(submitted);
+      if (!response) throw new Error('归属未保存，请重试。');
+      setParentId((current) => current === submitted ? '' : current);
+    } catch (err) { setError(pbEditorError(err, '更改归属失败，请重试。', '选择')); }
+    finally { pending.current = false; setSaving(false); }
+  }
+  return h('div', { className: 'pb-membership-editor' },
+    h('div', { className: 'pb-node-membership' + (!parents.length && node.kind !== 'theme' ? ' pb-unassigned' : ''), title: label }, label),
+    node.kind !== 'theme' && onReparentNode ? h('form', { className: 'pb-membership-form', onSubmit: submit, 'aria-busy': saving, onCompositionStart: () => { composing.current = true; }, onCompositionEnd: () => { composing.current = false; }, onKeyDown: (event) => { if (event.key === 'Enter' && !pbIsSubmitKey(event)) event.preventDefault(); } },
+      h('select', { className: 'pb-select', 'aria-label': '选择所属分支', value: parentId, onChange: (event) => setParentId(event.target.value) },
+        h('option', { value: '' }, parentCandidates.length ? '选择所属分支…' : '暂无可选分支'),
+        ...parentCandidates.map((parent) => h('option', { key: parent.id, value: parent.id }, parent.title))),
+      h('button', { type: 'submit', className: 'pb-btn small', disabled: saving || !parentId }, saving ? '保存中…' : '设置归属')) : null,
+    error ? h('div', { className: 'pb-form-error', role: 'alert' }, error) : null);
+}
+
+function PbChangeHistory({ board, targetType, targetId, onUndoChange }) {
+  const [undoing, setUndoing] = React.useState(''), [error, setError] = React.useState('');
+  const pending = React.useRef(false);
+  const changes = (board.changes || []).filter((change) => (change.targets || []).some((target) => target.type === targetType && target.id === targetId));
+  async function undo(changeId) {
+    if (pending.current || !onUndoChange) return;
+    pending.current = true; setUndoing(changeId); setError('');
+    try {
+      const response = await onUndoChange(changeId);
+      if (!response) throw new Error('撤销未完成；内容可能已变化，请核对最新历史后重试。');
+    } catch (err) { setError(pbEditorError(err, '撤销失败，请核对最新历史后重试。', '当前内容')); }
+    finally { pending.current = false; setUndoing(''); }
+  }
+  return h('section', { className: 'pb-sec pb-change-history' },
+    h('h3', null, '变更历史'),
+    ...changes.map((change) => h('div', { key: change.id, className: 'pb-change-row', 'data-change-id': change.id },
+      h(PbExpandableText, { text: change.summary || change.action }),
+      h('div', { className: 'pb-row-sub' }, (change.actor || '未记录操作者') + ' · ' + pbFormatTime(change.at)),
+      h('div', { className: 'pb-row-sub' }, (change.targets || []).map((target) => ({ node: '节点', task: '任务', todo: '待办' }[target.type] || target.type) + '：' + (target.title || target.id)).join(' · ')),
+      change.undo?.status === 'available' && onUndoChange ? h('button', { type: 'button', className: 'pb-btn small', disabled: !!undoing, onClick: () => undo(change.id) }, undoing === change.id ? '撤销中…' : '撤销此变更') : null,
+      change.undo?.status === 'undone' ? h('div', { className: 'pb-row-sub' }, '已撤销' + (change.undo.undoneBy ? ' · ' + change.undo.undoneBy : '') + (change.undo.undoneAt ? ' · ' + pbFormatTime(change.undo.undoneAt) : '')) : null,
+      change.undo?.status === 'unavailable' ? h('div', { className: 'pb-row-sub' }, '不可撤销' + (change.undo.reason ? '：' + change.undo.reason : '')) : null)),
+    changes.length ? null : h('div', { className: 'pb-empty' }, '暂无变更记录'),
+    error ? h('div', { className: 'pb-form-error', role: 'alert' }, error) : null);
+}
+
 // 任务、待办、备注共用轻量输入；失败保留草稿，成功只清理本次提交文本。
 function PbQuickAdd({ placeholder, onSubmit, label = '添加' }) {
   const [draft, setDraft] = React.useState('');
@@ -42,7 +203,7 @@ function PbStatusSelect({ value, onChange, statuses }) {
     ...(statuses || ['todo', 'doing', 'blocked', 'done']).map((status) => h('option', { key: status, value: status }, PB_STATUS_META[status]?.label || status)));
 }
 
-function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, threadUi, taskFocus, executionFor }) {
+function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, onOpenArtifact, threadUi, taskFocus, executionFor }) {
   const rowRef = React.useRef(null);
   const focused = taskFocus?.taskId === task.id;
   const [expanded, setExpanded] = React.useState(true);
@@ -84,13 +245,13 @@ function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, o
       }, canDispatch ? (dispatching ? '派发中…' : '派发') : '已派发'),
       h('button', { className: 'pb-icon-btn', title: '删除任务', onClick: () => runCommand('delete_task', { id: task.id }) }, h(PbIcon, { name: 'trash', size: 13 }))),
     expanded ? h('div', { style: { padding: '7px 9px 9px' } },
-      task.acceptance ? h('div', { className: 'pb-row-sub', style: { marginBottom: 6 } }, '验收：' + task.acceptance) : null,
+      h(PbDeliveryEditor, { item: task, targetType: 'task', runCommand, onOpenArtifact }),
       task.writeScopes?.length ? h('div', { className: 'pb-row-sub', style: { marginBottom: 6 } }, 'write scopes：' + task.writeScopes.join('、')) : null,
       h('div', { className: 'pb-row-sub', style: { marginBottom: 4 } }, `待办 ${todos.length} 项`),
       ...todos.map((todo) => h('div', { key: todo.id, className: 'pb-todo', 'data-todo-id': todo.id, onClick: () => onOpenTodo(todo.id) },
         h('span', { style: { width: 7, height: 7, borderRadius: 7, marginTop: 6, flex: 'none', background: (PB_STATUS_META[todo.status] || PB_STATUS_META.todo).color } }),
         h('div', { style: { flex: 1, minWidth: 0 } },
-          h('div', { className: 'pb-todo-title-line' }, h('div', { className: 'pb-todo-title' }, todo.title), h(PbExecutionBadge, { value: executionFor(todo) })),
+          h('div', { className: 'pb-todo-title-line' }, h('button', { type: 'button', className: 'pb-todo-title', 'aria-label': '打开待办：' + todo.title, onClick: (event) => { event.stopPropagation(); onOpenTodo(todo.id); } }, todo.title), h(PbExecutionBadge, { value: executionFor(todo) })),
           h('div', { className: 'pb-todo-meta' },
             h('span', null, (PB_STATUS_META[todo.status] || PB_STATUS_META.todo).label),
             h(PbConversationMenu, {
@@ -100,8 +261,8 @@ function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, o
               onCreate: () => threadUi.create('todo', todo.id),
               onRemove: (id) => threadUi.remove('todo', todo.id, id),
             }),
-            todo.team ? h(PbTeamBadge, { sessionsSnapshot, claim: todo.team }) : null,
-            todo.acceptance ? h('span', null, '验收：' + todo.acceptance.slice(0, 40)) : null)),
+            todo.team ? h(PbTeamBadge, { sessionsSnapshot, claim: todo.team }) : null),
+          h(PbDeliveryEditor, { item: todo, targetType: 'todo', runCommand, onOpenArtifact })),
         h('div', { className: 'pb-actions' },
           h('button', { className: 'pb-icon-btn', title: '删除待办', onClick: (event) => { event.stopPropagation(); runCommand('delete_todo', { id: todo.id }); } }, h(PbIcon, { name: 'trash', size: 12 }))))),
       todos.length === 0 ? h('div', { className: 'pb-row-sub', style: { margin: '2px 0 6px' } }, '还没有待办') : null,
@@ -123,7 +284,7 @@ function PbArtifactPreview({ workspacePath, row, onOpenArtifact }) {
   return h('a', { ...link, className: 'pb-chip', style: { marginTop: 5, textDecoration: 'none' } }, h(PbIcon, { name: row.kind === 'dir' ? 'folder' : 'file', size: 11 }), row.label || pbShortPath(row.path, 40));
 }
 
-function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, onClose, onDispatchTask, threadUi, tab = 'overview', onTabChange, onOpenArtifact, taskFocus, executionFor }) {
+function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, onClose, onDispatchTask, threadUi, tab = 'overview', onTabChange, onOpenArtifact, taskFocus, executionFor, parentCandidates, onReparentNode, onUndoChange }) {
   const tasks = pbNodeTasks(board, node.id);
   const scrollRef = React.useRef(null);
   React.useLayoutEffect(() => {
@@ -131,13 +292,12 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
   }, [taskFocus?.requestId, tab]);
   const [summary, setSummary] = React.useState(node.summary || '');
   const [savingSummary, setSavingSummary] = React.useState(false);
+  const [summaryError, setSummaryError] = React.useState('');
+  const summaryPending = React.useRef(false), summaryComposing = React.useRef(false);
   const notes = board.notes.filter((row) => row.targetType === 'node' && row.targetId === node.id);
   const decisions = board.decisions.filter((row) => row.nodeId === node.id);
   const meta = PB_KIND_META[node.kind] || PB_KIND_META.experiment;
   const status = pbDerivedNodeStatus(board, node.id);
-  const branchPath = pbNodeBranchPath(board, node.id);
-  const branchLabel = branchPath.length ? '所属分支：' + branchPath.map((parent) => parent.title).join(' / ')
-    : node.kind === 'theme' ? '顶层项目分支' : '未归属 · 用「连线 → 归属」加入分支';
   const savedSummary = React.useRef(node.summary || '');
   React.useEffect(() => {
     const previous = savedSummary.current;
@@ -147,20 +307,24 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
 
   const artifacts = [
     ...(node.links || []).map((row) => ({ ...row, label: row.label || row.path, source: '链接' })),
-    ...tasks.flatMap((task) => (task.artifacts || []).map((row) => ({ ...row, label: row.label || row.path, source: task.title }))),
-    ...tasks.flatMap((task) => pbTaskTodos(board, task.id).flatMap((todo) => (todo.artifacts || []).map((row) => ({ ...row, label: row.label || row.path, source: task.title + ' / ' + todo.title })))),
+    ...tasks.flatMap((task) => (task.artifacts || []).map((row) => ({ ...row, label: row.label || row.path, source: task.title, primary: task.primaryArtifactPath === row.path }))),
+    ...tasks.flatMap((task) => pbTaskTodos(board, task.id).flatMap((todo) => (todo.artifacts || []).map((row) => ({ ...row, label: row.label || row.path, source: task.title + ' / ' + todo.title, primary: todo.primaryArtifactPath === row.path })))),
   ];
 
   async function saveSummary(event) {
     event.preventDefault();
-    if (savingSummary || summary === (node.summary || '')) return;
-    setSavingSummary(true);
-    try { await runCommand('upsert_node', { node: { id: node.id, summary } }); }
-    finally { setSavingSummary(false); }
+    if (summaryPending.current || summaryComposing.current || summary === (node.summary || '')) return;
+    summaryPending.current = true; setSavingSummary(true); setSummaryError('');
+    try {
+      const response = await runCommand('upsert_node', { node: { id: node.id, summary } }, { throwOnError: true });
+      if (!response) throw new Error('概览未保存，草稿已保留，请重试。');
+    } catch (err) { setSummaryError(pbEditorError(err, '保存失败，草稿已保留，请重试。')); }
+    finally { summaryPending.current = false; setSavingSummary(false); }
   }
 
   // 概览占一行，任务紧接下方；回车和保存按钮使用同一写入命令。
-  const overviewEditor = h('form', { className: 'pb-sec pb-overview-editor', onSubmit: saveSummary },
+  const overviewEditor = h('div', null, h('form', { className: 'pb-sec pb-overview-editor', onSubmit: saveSummary,
+    onCompositionStart: () => { summaryComposing.current = true; }, onCompositionEnd: () => { summaryComposing.current = false; } },
     h('label', { htmlFor: 'pb-node-overview' }, '概览'),
     h('input', {
       id: 'pb-node-overview', type: 'text', className: 'pb-input', 'aria-label': '概览',
@@ -168,7 +332,9 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
       onChange: (event) => setSummary(event.target.value),
       onKeyDown: (event) => { if (event.key === 'Enter' && !pbIsSubmitKey(event)) event.preventDefault(); },
     }),
-    h('button', { type: 'submit', className: 'pb-btn small', disabled: savingSummary || summary === (node.summary || '') }, savingSummary ? '保存中…' : '保存'));
+    h('button', { type: 'submit', className: 'pb-btn small', disabled: savingSummary || summary === (node.summary || '') }, savingSummary ? '保存中…' : '保存')),
+    summaryError ? h('div', { className: 'pb-form-error', role: 'alert' }, summaryError) : null,
+    summary.length > 150 || /[\r\n]/.test(summary) ? h('div', { className: 'pb-sec pb-overview-original' }, h(PbExpandableText, { text: summary })) : null);
 
   const sourcesSection = h('div', null,
     h('div', { className: 'pb-sec' },
@@ -185,7 +351,7 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
 
   const tasksTab = h('div', { className: 'pb-sec' },
     h('h3', null, '任务'),
-    ...tasks.map((task) => h(PbTaskRow, { key: task.id, board, task, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, threadUi, taskFocus, executionFor })),
+    ...tasks.map((task) => h(PbTaskRow, { key: task.id, board, task, workspacePath, sessionsSnapshot, runCommand, onOpenTodo, onOpenArtifact, threadUi, taskFocus, executionFor })),
     tasks.length === 0 ? h('div', { className: 'pb-empty' }, '还没有任务') : null,
     h(PbQuickAdd, { placeholder: '新增任务…（回车添加）',
       onSubmit: (title) => runCommand('upsert_task', { task: { nodeId: node.id, title } }) }));
@@ -193,25 +359,27 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
   const artifactsTab = h('div', { className: 'pb-sec' },
     h('h3', null, '产物与文件'),
     ...artifacts.map((row, index) => h('div', { key: index, style: { marginBottom: 10 } },
-      h('div', { className: 'pb-row-sub' }, row.source + ' · ' + row.path),
+      h('div', { className: 'pb-row-sub' }, row.primary ? h('span', { className: 'pb-primary-label' }, '当前采用') : null, row.source + ' · ' + row.path),
       h(PbArtifactPreview, { workspacePath, row, onOpenArtifact }))),
     artifacts.length === 0 ? h('div', { className: 'pb-empty' }, '还没有产物链接') : null);
 
   const historyTab = h('div', null,
+    h(PbChangeHistory, { key: 'node:' + node.id, board, targetType: 'node', targetId: node.id, onUndoChange }),
     h('div', { className: 'pb-sec' },
       h('h3', null, '备注'),
       ...notes.map((row) => h('div', { key: row.id, className: 'pb-row' },
         h('div', { className: 'pb-row-text' },
-          h('div', { className: 'pb-row-title' }, row.text),
+          h(PbExpandableText, { text: row.text }),
           h('div', { className: 'pb-row-sub' }, (row.author || '我') + ' · ' + pbFormatTime(row.createdAt))),
         h('button', { className: 'pb-icon-btn', onClick: () => runCommand('delete_note', { id: row.id }) }, h(PbIcon, { name: 'trash', size: 12 })))),
       h(PbQuickAdd, { placeholder: '新增备注…（回车保存）',
         onSubmit: (text) => runCommand('add_note', { targetType: 'node', targetId: node.id, text, author: '我' }) }),
       h('h3', { style: { marginTop: 14 } }, '决策项'),
-      ...decisions.map((row) => h('div', { key: row.id, className: 'pb-row' },
+      ...decisions.map((row) => h('div', { key: row.id, className: 'pb-row', 'data-decision-id': row.id },
         h('div', { className: 'pb-row-text' },
-          h('div', { className: 'pb-row-title' }, row.question),
-          h('div', { className: 'pb-row-sub' }, row.status === 'open' ? '待决策' : '已答复：' + (row.answer || ''))))),
+          h(PbExpandableText, { text: row.question }),
+          h('div', { className: 'pb-row-sub' }, row.status === 'open' ? '待决策' : '已答复'),
+          row.status !== 'open' && row.answer ? h(PbExpandableText, { text: row.answer }) : null))),
       decisions.length === 0 ? h('div', { className: 'pb-empty' }, '没有决策项') : null));
 
   const overviewAndTasks = h(React.Fragment, null, overviewEditor, tasksTab, sourcesSection);
@@ -229,7 +397,7 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
         h('span', { className: 'pb-spacer' }),
         h('button', { className: 'pb-icon-btn', title: '删除节点', onClick: () => { if (window.confirm('删除节点「' + node.title + '」及其任务和待办？')) runCommand('delete_node', { id: node.id }); } }, h(PbIcon, { name: 'trash', size: 14 })),
         h('button', { className: 'pb-icon-btn', title: '取消选择', onClick: onClose }, h(PbIcon, { name: 'close', size: 15 }))),
-      h('div', { className: 'pb-node-membership', title: branchLabel }, branchLabel),
+      h(PbNodeMembership, { key: node.id, board, node, parentCandidates, onReparentNode }),
       h('div', { className: 'pb-tabs', role: 'tablist' },
         ...[['overview', '概览和任务'], ['artifacts', '产物'], ['history', '历史']].map(([id, label]) =>
           h('button', { key: id, className: 'pb-tab', role: 'tab', 'aria-selected': id === 'overview' ? tab !== 'artifacts' && tab !== 'history' : tab === id, onClick: () => onTabChange(id) }, label)))),

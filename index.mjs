@@ -113,7 +113,7 @@ export async function apply(ctx) {
       input: body.input,
       actor: typeof body.actor === 'string' ? body.actor : 'user',
     });
-    return jsonResponse(200, { board: result.board, workspace: result.workspace, replayed: Boolean(result.replayed) });
+    return jsonResponse(200, { board: result.board, workspace: result.workspace, replayed: Boolean(result.replayed), changeId: result.changeId, lastChange: result.lastChange });
   }]);
 
   routes.push(['POST', '/api/project-board/dispatch', async (request) => {
@@ -126,7 +126,7 @@ export async function apply(ctx) {
       items: body.items,
       actor: typeof body.actor === 'string' ? body.actor : 'user',
     });
-    return jsonResponse(200, { board: result.board, created: result.created });
+    return jsonResponse(200, { board: result.board, created: result.created, changeId: result.changeId, lastChange: result.lastChange });
   }]);
 
   routes.push(['GET', '/api/project-board/thread', async (request) => {
@@ -319,11 +319,11 @@ export async function apply(ctx) {
         enum: [
           'create_board', 'rename_board', 'upsert_node', 'delete_node', 'upsert_edge', 'delete_edge',
           'upsert_task', 'delete_task', 'upsert_todo', 'delete_todo', 'move_todo', 'save_positions',
-          'add_note', 'delete_note', 'upsert_decision', 'delete_decision', 'bind_thread', 'unbind_thread',
+          'add_note', 'delete_note', 'upsert_decision', 'delete_decision', 'bind_thread', 'unbind_thread', 'undo_change',
         ],
         description: '看板操作类型',
       },
-      input: { type: 'json', description: '操作参数，例如 {node:{...}}、{id:"..."}、{positions:[{id,x,y}]}。bind_thread/unbind_thread 的 taskId 和 todoId 恰好提供一个，并提供 sessionId；绑定追加且幂等，不覆盖已有会话。仅旧 unbind_thread({todoId}) 可省略 sessionId 清空待办会话。upsert_task/upsert_todo 可保存 threads 数组。' },
+      input: { type: 'json', description: '操作参数，例如 {node:{...}}、{id:"..."}、{positions:[{id,x,y}]}。bind_thread/unbind_thread 的 taskId 和 todoId 恰好提供一个，并提供 sessionId；绑定追加且幂等，不覆盖已有会话。仅旧 unbind_thread({todoId}) 可省略 sessionId 清空待办会话。upsert_task/upsert_todo 可保存 threads、primaryArtifactPath，以及 delivery:{summary,outcome,review,submittedAt}；outcome 为 unspecified/supported/not_supported/not_triggered/inconclusive，review 为 none/pending/accepted/changes_requested。旧 acceptance 是验收要求，结论写 delivery。undo_change 用 {changeId} 撤销一条可撤销变更，遇到字段或关联冲突会拒绝。' },
     },
     output: {
       schema: { type: 'json' },
@@ -342,7 +342,7 @@ export async function apply(ctx) {
         actor: `agent:${agent?.id || 'unknown'}`,
         allowCreate: args.action === 'create_board',
       });
-      return jsonSafe({ ok: true, action: args.action, revision: result.board.revision, workspacePath: workspace.path, board: result.board });
+      return jsonSafe({ ok: true, action: args.action, revision: result.board.revision, workspacePath: workspace.path, board: result.board, changeId: result.changeId, lastChange: result.lastChange });
     },
   })), 'project-board tool: update');
 

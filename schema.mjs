@@ -2,14 +2,16 @@
 // The board file lives at <workspace>/board/project-board.json and is owned by
 // this plugin; workspace project files are never mutated.
 
+import { pbNodeIdsInScope, pbScopeStats, pbShortSummary } from './board-model.js';
+
 export const BOARD_VERSION = 1;
 export const BOARD_RELATIVE_PATH = 'board/project-board.json';
 
 export const NODE_KINDS = new Set(['theme', 'milestone', 'component', 'document', 'experiment', 'figure', 'manuscript', 'infra', 'historical']);
 export const NODE_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'active', 'deferred', 'historical']);
 export const EDGE_KINDS = new Set(['contains', 'depends', 'produces']);
-export const TASK_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'dropped']);
-export const TODO_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'dropped']);
+export const TASK_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'deferred', 'dropped', 'historical']);
+export const TODO_STATUSES = new Set(['todo', 'doing', 'blocked', 'done', 'deferred', 'dropped', 'historical']);
 export const DECISION_STATUSES = new Set(['open', 'answered']);
 
 export const LIMITS = {
@@ -20,6 +22,8 @@ export const LIMITS = {
   decisions: 120,
   notes: 400,
   applied: 40,
+  changes: 80,
+  changeBytes: 2 * 1024 * 1024,
   threads: 20,
   id: 120,
   title: 300,
@@ -162,6 +166,16 @@ function normalizeEdge(raw, now) {
   };
 }
 
+function normalizeDelivery(raw) {
+  const value = isObject(raw) ? raw : {};
+  return {
+    summary: asString(value.summary, LIMITS.description),
+    outcome: ['unspecified', 'supported', 'not_supported', 'not_triggered', 'inconclusive'].includes(value.outcome) ? value.outcome : 'unspecified',
+    review: ['none', 'pending', 'accepted', 'changes_requested'].includes(value.review) ? value.review : 'none',
+    submittedAt: asIso(value.submittedAt, ''),
+  };
+}
+
 function normalizeTask(raw, now) {
   if (!isObject(raw)) return null;
   const nodeId = asString(raw.nodeId, LIMITS.id);
@@ -173,6 +187,8 @@ function normalizeTask(raw, now) {
     status: TASK_STATUSES.has(raw.status) ? raw.status : 'todo',
     owner: asString(raw.owner, LIMITS.short),
     acceptance: asString(raw.acceptance, LIMITS.description),
+    delivery: normalizeDelivery(raw.delivery),
+    primaryArtifactPath: asString(raw.primaryArtifactPath, LIMITS.path),
     blockedBy: Array.isArray(raw.blockedBy) ? [...new Set(raw.blockedBy.map((v) => asString(v, LIMITS.id)).filter(Boolean))].slice(0, 40) : [],
     writeScopes: Array.isArray(raw.writeScopes) ? [...new Set(raw.writeScopes.map((v) => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 20) : [],
     artifacts: normalizeArtifacts(raw.artifacts),
@@ -219,6 +235,8 @@ function normalizeTodo(raw, now) {
     status: TODO_STATUSES.has(raw.status) ? raw.status : 'todo',
     owner: asString(raw.owner, LIMITS.short),
     acceptance: asString(raw.acceptance, LIMITS.description),
+    delivery: normalizeDelivery(raw.delivery),
+    primaryArtifactPath: asString(raw.primaryArtifactPath, LIMITS.path),
     order: Number.isFinite(raw.order) ? Math.trunc(raw.order) : 0,
     threads,
     team: normalizeTeam(raw.team, now),
@@ -255,6 +273,48 @@ function normalizeNote(raw, now) {
     author: asString(raw.author, LIMITS.short, 'user'),
     createdAt: asIso(raw.createdAt, now),
   };
+}
+
+const CHANGE_COLLECTIONS = new Set(['nodes', 'edges', 'tasks', 'todos', 'notes', 'decisions']);
+
+function normalizeChanges(input, now) {
+  const rows = [], seen = new Set();
+  let bytes = 0;
+  for (const raw of Array.isArray(input) ? input : []) {
+    if (!isObject(raw) || !ID_RE.test(raw.id || '') || seen.has(raw.id)) continue;
+    const patches = Array.isArray(raw.patches) ? raw.patches : [];
+    const guards = Array.isArray(raw.guards) ? raw.guards : [];
+    const validPatch = patch => isObject(patch) && CHANGE_COLLECTIONS.has(patch.collection) && ID_RE.test(patch.id || '') &&
+      Array.isArray(patch.path) && patch.path.length <= 2 && patch.path.every(key => typeof key === 'string' && !['__proto__', 'prototype', 'constructor', 'id'].includes(key)) &&
+      (patch.path.length === 0 || (typeof patch.rowCreatedAt === 'string' && Number.isFinite(Date.parse(patch.rowCreatedAt)))) &&
+      typeof patch.beforeExists === 'boolean' && typeof patch.afterExists === 'boolean' &&
+      (!patch.beforeExists || Object.hasOwn(patch, 'before')) && (!patch.afterExists || Object.hasOwn(patch, 'after'));
+    const validGuard = guard => isObject(guard) && CHANGE_COLLECTIONS.has(guard.collection) && ID_RE.test(guard.id || '') && Array.isArray(guard.relations) && guard.relations.every(value => typeof value === 'string') &&
+      (guard.parents === undefined || (Array.isArray(guard.parents) && guard.parents.every(parent => isObject(parent) && CHANGE_COLLECTIONS.has(parent.collection) && ID_RE.test(parent.id || '') && typeof parent.createdAt === 'string' && Number.isFinite(Date.parse(parent.createdAt)))));
+    const valid = patches.length > 0 && patches.every(validPatch) && guards.every(validGuard);
+    const undo = isObject(raw.undo) ? raw.undo : {};
+    const row = {
+      id: raw.id, at: asIso(raw.at, now), actor: asString(raw.actor, 200, 'system'),
+      action: asString(raw.action, 80), summary: asString(raw.summary, LIMITS.short),
+      targets: (Array.isArray(raw.targets) ? raw.targets : []).filter(target => isObject(target) && ['node', 'edge', 'task', 'todo', 'note', 'decision', 'board'].includes(target.type)).map(target => ({ type: target.type, id: asString(target.id, LIMITS.id), title: asString(target.title, LIMITS.title) })),
+      undo: {
+        status: undo.status === 'undone' ? 'undone' : undo.status === 'available' && valid ? 'available' : 'unavailable',
+        reason: asString(undo.reason, LIMITS.short), undoneAt: asIso(undo.undoneAt, ''), undoneBy: asString(undo.undoneBy, 200),
+      },
+      patches: valid ? patches : [], guards: valid ? guards : [],
+    };
+    let size = new TextEncoder().encode(JSON.stringify(row)).length;
+    if (size > LIMITS.changeBytes / 2) {
+      row.patches = []; row.guards = [];
+      row.undo = { ...row.undo, status: 'unavailable', reason: '变更过大，仅保留摘要，无法撤销' };
+      row.targets = row.targets.slice(0, 20);
+      size = new TextEncoder().encode(JSON.stringify(row)).length;
+    }
+    if (bytes + size > LIMITS.changeBytes) break;
+    bytes += size; seen.add(row.id); rows.push(row);
+    if (rows.length >= LIMITS.changes) break;
+  }
+  return rows;
 }
 
 /** Coerce any loaded value into a valid board; never throws on untrusted input. */
@@ -311,7 +371,7 @@ export function normalizeBoard(raw, options = {}) {
   const applied = [];
   for (const row of Array.isArray(source.applied) ? source.applied : []) {
     if (!isObject(row) || typeof row.id !== 'string' || !row.id) continue;
-    applied.push({ id: row.id.slice(0, 120), revision: Math.max(1, Math.trunc(Number(row.revision) || 1)), at: asIso(row.at, now) });
+    applied.push({ id: row.id.slice(0, 120), revision: Math.max(1, Math.trunc(Number(row.revision) || 1)), at: asIso(row.at, now), ...(row.changeId ? { changeId: asString(row.changeId, LIMITS.id) } : {}) });
     if (applied.length >= LIMITS.applied) break;
   }
   const assistant = isObject(source.assistant) && typeof source.assistant.sessionId === 'string' && source.assistant.sessionId
@@ -336,6 +396,7 @@ export function normalizeBoard(raw, options = {}) {
     decisions,
     notes,
     applied,
+    changes: normalizeChanges(source.changes, now),
     ...(assistant ? { assistant } : {}),
   };
 }
@@ -350,21 +411,7 @@ export function boardDigest(board, { workspacePath, teamTasks, sessionId } = {})
   if (!board) return '';
   const byId = new Map(board.nodes.map((n) => [n.id, n]));
   const tasksById = new Map(board.tasks.map((task) => [task.id, task]));
-  const tasksByNode = new Map();
-  for (const task of board.tasks) {
-    if (!tasksByNode.has(task.nodeId)) tasksByNode.set(task.nodeId, []);
-    tasksByNode.get(task.nodeId).push(task);
-  }
-  const statusCount = (rows) => {
-    const count = { todo: 0, doing: 0, blocked: 0, done: 0 };
-    for (const row of rows) {
-      if (row.status === 'doing' || row.status === 'active') count.doing += 1;
-      else if (row.status === 'blocked' || row.status === 'deferred') count.blocked += 1;
-      else if (row.status === 'done' || row.status === 'historical') count.done += 1;
-      else count.todo += 1;
-    }
-    return `${count.doing} 进行 / ${count.blocked} 受阻 / ${count.done} 完成 / ${count.todo} 待办`;
-  };
+  const statusCount = (stats) => `${stats.doing} 进行 / ${stats.blocked} 受阻 / ${stats.done} 完成 / ${stats.todo} 待办 / ${stats.deferred} 暂缓 / ${stats.dropped} 放弃 / ${stats.historical} 历史；已结束 ${stats.closed}/${stats.total}（${stats.pct}%）`;
   const lines = [];
   // 同一会话可绑定多个任务和待办；优先显示全部匹配，避免只识别首个待办。
   const inSession = (row) => sessionId && (row.threads || []).some((thread) => thread.sessionId === sessionId);
@@ -383,28 +430,32 @@ export function boardDigest(board, { workspacePath, teamTasks, sessionId } = {})
     }
     lines.push('按实际进展用 project_board_update 更新对应任务/待办状态；绑定会话本身不代表开始或完成。');
   }
-  lines.push(`项目看板（workspace: ${workspacePath}，revision ${board.revision}，更新 ${new Date(board.updatedAt).toISOString()}）`);
+  lines.push(`项目看板（workspace: ${pbShortSummary(workspacePath || board.workspacePath || board.title, 180)}，revision ${board.revision}，更新 ${new Date(board.updatedAt).toISOString()}）`);
   const threadedTasks = board.tasks.filter((task) => task.threads?.length);
   const threadedTodos = board.todos.filter((todo) => todo.threads?.length);
   if (threadedTasks.length || threadedTodos.length) {
     const sessions = new Set([...threadedTasks, ...threadedTodos].flatMap((row) => row.threads.map((thread) => thread.sessionId)));
     lines.push(`- 已绑定会话：${threadedTasks.length} 个任务 / ${threadedTodos.length} 个待办，共 ${sessions.size} 个会话`);
   }
+  lines.push(`- 全板末级工作项：${statusCount(pbScopeStats(board))}`);
   const themes = board.nodes.filter((n) => n.kind === 'theme');
-  const others = board.nodes.filter((n) => n.kind !== 'theme');
-  for (const theme of themes) {
-    const children = board.edges.filter((e) => e.kind === 'contains' && e.from === theme.id).map((e) => byId.get(e.to)).filter(Boolean);
-    const tasks = children.flatMap((child) => tasksByNode.get(child.id) || []);
-    lines.push(`- ${theme.title}（${children.length} 节点；${statusCount(tasks)}）`);
-    for (const child of children.slice(0, 8)) {
-      const rows = tasksByNode.get(child.id) || [];
-      lines.push(`  · ${child.title}${rows.length ? ` — ${statusCount(rows)}` : ''}`);
-    }
-    if (children.length > 8) lines.push(`  · …共 ${children.length} 个节点`);
-  }
-  const looseNodes = others.filter((node) => !board.edges.some((e) => e.kind === 'contains' && e.to === node.id));
+  const assigned = new Set(themes.flatMap(theme => pbNodeIdsInScope(board, theme.id)));
+  const looseNodes = board.nodes.filter(node => !assigned.has(node.id));
   if (looseNodes.length) {
-    lines.push(`- 其他节点：${looseNodes.slice(0, 10).map((n) => `${n.title}(${n.status})`).join('、')}${looseNodes.length > 10 ? ` 等 ${looseNodes.length} 个` : ''}`);
+    const looseIds = new Set(looseNodes.map(node => node.id));
+    const looseBoard = { ...board, nodes: looseNodes, tasks: board.tasks.filter(task => looseIds.has(task.nodeId)) };
+    lines.push(`- 未归属主题：${looseNodes.length} 节点；${statusCount(pbScopeStats(looseBoard))}`);
+    lines.push(`  · ${looseNodes.slice(0, 10).map(node => `${pbShortSummary(node.title, 45)}(${node.status})`).join('、')}${looseNodes.length > 10 ? ` 等 ${looseNodes.length} 个` : ''}`);
+  }
+  for (const theme of themes) {
+    const stats = pbScopeStats(board, theme.id);
+    const children = stats.nodeIds.filter(id => id !== theme.id).map(id => byId.get(id));
+    lines.push(`- ${pbShortSummary(theme.title, 70)}（含自身 ${stats.nodeIds.length} 节点；${statusCount(stats)}）`);
+    for (const child of children.slice(0, 8)) {
+      const childStats = pbScopeStats(board, child.id);
+      lines.push(`  · ${pbShortSummary(child.title, 70)}${childStats.taskCount ? ` — ${statusCount(childStats)}` : ''}`);
+    }
+    if (children.length > 8) lines.push(`  · …共 ${children.length} 个后代节点`);
   }
   const doing = board.todos.filter((t) => t.status === 'doing' || t.status === 'active');
   if (doing.length) {
@@ -419,14 +470,29 @@ export function boardDigest(board, { workspacePath, teamTasks, sessionId } = {})
   }
   const open = board.decisions.filter((d) => d.status === 'open');
   if (open.length) {
-    lines.push(`- 待决策：${open.slice(0, 4).map((d) => d.question).join('；')}${open.length > 4 ? ` 等 ${open.length} 条` : ''}`);
+    lines.push(`- 待决策：${open.slice(0, 4).map((d) => pbShortSummary(d.question, 140)).join('；')}${open.length > 4 ? ` 等 ${open.length} 条` : ''}`);
   }
   const boardNotes = board.notes.filter((n) => n.targetType === 'board');
   if (boardNotes.length) {
-    lines.push(`- 最新备注：${boardNotes.slice(-2).map((n) => n.text.split('\n')[0]).join(' / ')}`);
+    lines.push(`- 最新备注摘要：${boardNotes.slice(-2).map((n) => pbShortSummary(n.text)).join(' / ')}（正文保留在看板）`);
   }
-  lines.push('约定：规划、汇报项目状态前先读看板；工作完成后用 project_board_update 回写节点/任务/待办状态；不要另建状态文件。');
-  return lines.join('\n').slice(0, 4000);
+  const convention = '约定：规划、汇报项目状态前先读看板；工作完成后用 project_board_update 回写节点/任务/待办状态；不要另建状态文件。';
+  const omission = '（部分条目省略；完整内容请读取看板。）';
+  // 给总数、未归属条目、决策、最新结论和约定留足预算，逐行省略其余内容。
+  const fixed = new Set(lines.filter(line => /^(项目看板|\- 全板末级|\- 未归属主题|\- 待决策|\- 最新备注摘要)/.test(line)));
+  const fixedSize = [...fixed].reduce((sum, line) => sum + line.length + 1, 0);
+  const selected = [], budget = 4000 - convention.length - omission.length - fixedSize - 3;
+  let used = 0, omitted = false;
+  for (const line of lines) {
+    if (!fixed.has(line)) {
+      if (used + line.length + 1 > budget) { omitted = true; continue; }
+      used += line.length + 1;
+    }
+    selected.push(line);
+  }
+  if (omitted) selected.push(omission);
+  selected.push(convention);
+  return selected.join('\n');
 }
 
 /** Build a compact transcript entry from raw session events (filled by thread.mjs). */

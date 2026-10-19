@@ -1,6 +1,8 @@
 // Board service: workspace validation, revision CAS, command application,
 // Agent Teams dispatch, and board digests for agent prompts.
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { pbShortSummary } from './board-model.js';
 import {
   BoardError,
   LIMITS,
@@ -22,6 +24,7 @@ const ACTIONS = new Set([
   'add_note', 'delete_note',
   'upsert_decision', 'delete_decision',
   'bind_thread', 'unbind_thread', 'bind_assistant', 'unbind_assistant',
+  'undo_change',
 ]);
 
 function isoNow() {
@@ -78,6 +81,176 @@ function findThreadTarget(board, body) {
 function nextOrder(rows, taskId) {
   const scoped = rows.filter((row) => row.taskId === taskId);
   return scoped.length ? Math.max(...scoped.map((row) => row.order || 0)) + 1 : 0;
+}
+
+const HISTORY_COLLECTIONS = ['nodes', 'edges', 'tasks', 'todos', 'notes', 'decisions'];
+const HISTORY_TYPES = { nodes: 'node', edges: 'edge', tasks: 'task', todos: 'todo', notes: 'note', decisions: 'decision' };
+const UNDO_ACTIONS = new Set(['save_positions', 'upsert_node', 'delete_node', 'upsert_edge', 'delete_edge', 'upsert_task', 'delete_task', 'upsert_todo', 'delete_todo', 'move_todo', 'add_note', 'delete_note', 'upsert_decision', 'delete_decision']);
+const ACTION_LABELS = { save_positions: '调整节点位置', upsert_node: '编辑节点', delete_node: '删除节点', upsert_edge: '编辑连线', delete_edge: '删除连线', upsert_task: '编辑任务', delete_task: '删除任务', upsert_todo: '编辑待办', delete_todo: '删除待办', move_todo: '调整待办顺序', add_note: '添加备注', delete_note: '删除备注', upsert_decision: '编辑决策', delete_decision: '删除决策', bind_thread: '绑定会话', unbind_thread: '解绑会话', bind_assistant: '绑定看板助手', unbind_assistant: '解绑看板助手', rename_board: '重命名看板', dispatch: '派发团队任务', undo_change: '撤销变更' };
+const plain = value => JSON.parse(JSON.stringify(value));
+
+// 仅记录变动的字段；时间戳是副作用，不阻挡同条目其他字段的独立编辑。
+function historyPatches(before, after) {
+  const patches = [];
+  for (const collection of HISTORY_COLLECTIONS) {
+    const oldRows = new Map(before[collection].map(row => [row.id, row]));
+    const newRows = new Map(after[collection].map(row => [row.id, row]));
+    for (const id of new Set([...oldRows.keys(), ...newRows.keys()])) {
+      const previous = oldRows.get(id), current = newRows.get(id);
+      const add = (path, oldValue, newValue, beforeExists, afterExists) => patches.push({ collection, id, path, beforeExists, afterExists, ...(path.length ? { rowCreatedAt: current.createdAt } : {}), ...(beforeExists ? { before: oldValue } : {}), ...(afterExists ? { after: newValue } : {}) });
+      if (!previous || !current) {
+        add([], previous, current, Boolean(previous), Boolean(current));
+        patches[patches.length - 1].index = (previous ? before : after)[collection].findIndex(row => row.id === id);
+        continue;
+      }
+      for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+        if (key === 'updatedAt' || isDeepStrictEqual(previous[key], current[key])) continue;
+        if (key === 'delivery' && previous.delivery && current.delivery) {
+          for (const field of new Set([...Object.keys(previous.delivery), ...Object.keys(current.delivery)])) {
+            if (!isDeepStrictEqual(previous.delivery[field], current.delivery[field])) add([key, field], previous.delivery[field], current.delivery[field], Object.hasOwn(previous.delivery, field), Object.hasOwn(current.delivery, field));
+          }
+        } else add([key], previous[key], current[key], Object.hasOwn(previous, key), Object.hasOwn(current, key));
+      }
+    }
+  }
+  return patches;
+}
+
+// 新建/删除整个条目时还需锁定关联成员，防止撤销连带丢失后来新增的工作。
+function historyRelations(board, collection, id) {
+  const relations = [];
+  const add = (name, row, field) => relations.push(`${name}:${row.id}:${field}`);
+  if (collection === 'nodes') {
+    for (const row of board.edges) if (row.from === id || row.to === id) add('edges', row, row.from === id ? 'from' : 'to');
+    for (const row of board.tasks) if (row.nodeId === id) add('tasks', row, 'nodeId');
+    for (const row of board.decisions) if (row.nodeId === id) add('decisions', row, 'nodeId');
+  }
+  if (collection === 'tasks') {
+    for (const row of board.todos) if (row.taskId === id) add('todos', row, 'taskId');
+    for (const row of board.tasks) if (row.blockedBy.includes(id)) add('tasks', row, 'blockedBy');
+  }
+  const type = HISTORY_TYPES[collection];
+  for (const row of board.notes) if (row.targetType === type && row.targetId === id) add('notes', row, 'targetId');
+  return relations.sort();
+}
+
+function historyTargets(before, after, patches) {
+  const targets = new Map();
+  const oldRows = Object.fromEntries(HISTORY_COLLECTIONS.map(name => [name, new Map(before[name].map(row => [row.id, row]))]));
+  const rows = Object.fromEntries(HISTORY_COLLECTIONS.map(name => [name, new Map([...before[name], ...after[name]].map(row => [row.id, row]))]));
+  const parents = new Map();
+  for (const edge of [...before.edges, ...after.edges]) if (edge.kind === 'contains') {
+    if (!parents.has(edge.to)) parents.set(edge.to, new Set());
+    parents.get(edge.to).add(edge.from);
+  }
+  const add = (collection, id) => {
+    const type = HISTORY_TYPES[collection], key = `${type}:${id}`;
+    if (!type || !id || targets.has(key)) return;
+    const row = rows[collection].get(id);
+    targets.set(key, { type, id, title: pbShortSummary(row?.title || row?.label || row?.question || row?.text || id, 120) });
+    if (collection === 'nodes') for (const parent of parents.get(id) || []) add('nodes', parent);
+    for (const version of [oldRows[collection].get(id), row].filter(Boolean)) {
+      if (version.nodeId) add('nodes', version.nodeId);
+      if (version.taskId && collection === 'todos') add('tasks', version.taskId);
+      if (collection === 'edges') { add('nodes', version.from); add('nodes', version.to); }
+      if (collection === 'notes') add(Object.keys(HISTORY_TYPES).find(name => HISTORY_TYPES[name] === version.targetType), version.targetId);
+    }
+  };
+  for (const patch of patches) add(patch.collection, patch.id);
+  return [...targets.values()];
+}
+
+function historyGuard(before, after, patch) {
+  const parents = new Map();
+  const remember = (collection, id) => {
+    const row = after[collection]?.find(item => item.id === id);
+    if (row) parents.set(`${collection}:${id}`, { collection, id, createdAt: row.createdAt });
+  };
+  for (const board of [before, after]) {
+    const row = board[patch.collection].find(item => item.id === patch.id);
+    if (!row) continue;
+    if (row.nodeId) remember('nodes', row.nodeId);
+    if (patch.collection === 'todos') remember('tasks', row.taskId);
+    if (patch.collection === 'edges') { remember('nodes', row.from); remember('nodes', row.to); }
+    if (patch.collection === 'tasks') for (const id of row.blockedBy) remember('tasks', id);
+    if (patch.collection === 'notes') remember(Object.keys(HISTORY_TYPES).find(name => HISTORY_TYPES[name] === row.targetType), row.targetId);
+  }
+  return { collection: patch.collection, id: patch.id, checkRelations: patch.path.length === 0, relations: patch.path.length === 0 ? historyRelations(after, patch.collection, patch.id) : [], parents: [...parents.values()] };
+}
+
+function makeHistory(before, after, action, actor, patches = historyPatches(before, after)) {
+  const targets = historyTargets(before, after, patches);
+  const external = patches.some(patch => ['team', 'threads'].includes(patch.path[0]) || (patch.path.length === 0 && !patch.beforeExists && (patch.after?.team || patch.after?.threads?.length)));
+  const available = UNDO_ACTIONS.has(action) && patches.length > 0 && !external;
+  return {
+    id: newId('change'), at: isoNow(), actor, action,
+    summary: `${ACTION_LABELS[action] || action}${targets.length ? `：${targets[0].title}` : ''}${new Set(patches.map(patch => `${patch.collection}:${patch.id}`)).size > 1 ? '（含关联条目）' : ''}`,
+    targets,
+    undo: { status: available ? 'available' : 'unavailable', reason: available ? '' : external ? '会话或团队关联变更不支持撤销' : patches.length ? '此操作不支持撤销' : '没有可撤销的字段变动', undoneAt: '', undoneBy: '' },
+    patches: available ? patches : [],
+    guards: available ? [...new Map(patches.map(patch => [`${patch.collection}:${patch.id}`, historyGuard(before, after, patch)])).values()] : [],
+  };
+}
+
+function invalidRelations(board) {
+  const invalid = new Set(), nodes = new Set(board.nodes.map(row => row.id)), tasks = new Set(board.tasks.map(row => row.id)), todos = new Set(board.todos.map(row => row.id));
+  for (const row of board.edges) for (const field of ['from', 'to']) if (!nodes.has(row[field])) invalid.add(`edge:${row.id}:${field}:${row[field]}`);
+  for (const row of board.tasks) {
+    if (!nodes.has(row.nodeId)) invalid.add(`task:${row.id}:nodeId:${row.nodeId}`);
+    for (const id of row.blockedBy) if (!tasks.has(id)) invalid.add(`task:${row.id}:blockedBy:${id}`);
+  }
+  for (const row of board.todos) if (!tasks.has(row.taskId)) invalid.add(`todo:${row.id}:taskId:${row.taskId}`);
+  for (const row of board.decisions) if (row.nodeId && !nodes.has(row.nodeId)) invalid.add(`decision:${row.id}:${row.nodeId}`);
+  for (const row of board.notes) {
+    const known = { node: nodes, task: tasks, todo: todos }[row.targetType];
+    if (known && !known.has(row.targetId)) invalid.add(`note:${row.id}:${row.targetType}:${row.targetId}`);
+  }
+  return invalid;
+}
+
+function undoHistory(board, changeId, actor) {
+  const change = board.changes.find(row => row.id === changeId);
+  if (!change) throw new BoardError('CHANGE_NOT_FOUND', '变更记录不存在或已超出保留范围', 404);
+  if (change.undo.status !== 'available') throw new BoardError('UNDO_UNAVAILABLE', change.undo.status === 'undone' ? '这条变更已撤销' : change.undo.reason || '这条变更不可撤销', 409);
+  const conflict = () => { throw new BoardError('UNDO_CONFLICT', '受影响字段或关联已被更新，无法安全撤销；请刷新后查看当前内容', 409, { changeId }); };
+  for (const patch of change.patches) {
+    const row = board[patch.collection].find(item => item.id === patch.id);
+    if (patch.path.length && row?.createdAt !== patch.rowCreatedAt) conflict();
+    let parent = row;
+    for (const key of patch.path.slice(0, -1)) parent = parent?.[key];
+    const key = patch.path.at(-1), exists = patch.path.length ? Boolean(parent && Object.hasOwn(parent, key)) : Boolean(row);
+    const value = patch.path.length ? parent?.[key] : row;
+    if (exists !== patch.afterExists || (exists && !isDeepStrictEqual(plain(value), patch.after))) conflict();
+  }
+  for (const guard of change.guards) {
+    if (guard.checkRelations !== false && !isDeepStrictEqual(historyRelations(board, guard.collection, guard.id), guard.relations)) conflict();
+    for (const parent of guard.parents || []) if (board[parent.collection].find(row => row.id === parent.id)?.createdAt !== parent.createdAt) conflict();
+  }
+  const candidate = plain(board), now = isoNow();
+  for (const patch of [...change.patches].reverse()) {
+    const rows = candidate[patch.collection], index = rows.findIndex(row => row.id === patch.id);
+    if (patch.path.length === 0) {
+      if (patch.beforeExists) {
+        if (index >= 0) rows[index] = plain(patch.before);
+        else rows.splice(Math.max(0, Math.min(rows.length, patch.index || 0)), 0, plain(patch.before));
+      } else if (index >= 0) rows.splice(index, 1);
+    } else {
+      if (index < 0) conflict();
+      let parent = rows[index];
+      for (const key of patch.path.slice(0, -1)) parent = parent[key];
+      const key = patch.path.at(-1);
+      if (patch.beforeExists) parent[key] = plain(patch.before); else delete parent[key];
+      if (Object.hasOwn(rows[index], 'updatedAt')) rows[index].updatedAt = now;
+    }
+  }
+  // 只拒绝本次撤销新产生的悬空关系；既有无关历史数据不成为全局锁。
+  const previousInvalid = invalidRelations(board);
+  for (const issue of invalidRelations(candidate)) if (!previousInvalid.has(issue)) conflict();
+  const normalized = normalizeBoard(candidate);
+  for (const collection of HISTORY_COLLECTIONS) if (normalized[collection].length !== candidate[collection].length) conflict();
+  for (const collection of HISTORY_COLLECTIONS) board[collection] = candidate[collection];
+  change.undo = { status: 'undone', reason: '', undoneAt: now, undoneBy: actor };
+  return change;
 }
 
 export class BoardService {
@@ -180,31 +353,39 @@ export class BoardService {
         return { board, workspace, created: true };
       }
       const board = current.board;
-      if (commandId && board.applied.some((row) => row.id === commandId)) {
-        return { board, workspace, replayed: true };
+      const applied = commandId && board.applied.find((row) => row.id === commandId);
+      if (applied) {
+        const lastChange = board.changes.find(row => row.id === applied.changeId);
+        return { board, workspace, replayed: true, changeId: applied.changeId, lastChange };
       }
       if (expected !== null && expected !== board.revision) {
         throw new BoardError('STALE_REVISION', `看板已被更新（当前 revision ${board.revision}，提交 ${expected}），请重载后再试`, 409, { revision: board.revision });
       }
+      const before = plain(board);
       this.applyCommand(board, action, body, actor);
       board.revision += 1;
       board.updatedAt = isoNow();
       board.updatedBy = actor;
-      if (commandId) {
-        board.applied.unshift({ id: commandId, revision: board.revision, at: board.updatedAt });
-        board.applied = board.applied.slice(0, LIMITS.applied);
-      }
       const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
-      await this.store.write(workspace.path, normalized);
-      this.cache.set(workspace.path, { mtimeMs: Date.now(), board: normalized });
-      this.store.notify({ workspacePath: workspace.path, board: normalized, actor });
-      return { board: normalized, workspace };
+      const change = makeHistory(before, plain(normalized), action, actor);
+      if (action === 'undo_change') change.summary = `撤销：${before.changes.find(row => row.id === body.changeId)?.summary || body.changeId}`;
+      normalized.changes.unshift(change);
+      if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
+      const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
+      await this.store.write(workspace.path, committed);
+      this.cache.set(workspace.path, { mtimeMs: Date.now(), board: committed });
+      this.store.notify({ workspacePath: workspace.path, board: committed, actor });
+      return { board: committed, workspace, changeId: change.id, lastChange: committed.changes[0] };
     });
   }
 
   applyCommand(board, action, body, actor) {
     const now = isoNow();
     switch (action) {
+      case 'undo_change': {
+        undoHistory(board, asString(body.changeId, LIMITS.id), actor);
+        return;
+      }
       case 'create_board':
       case 'rename_board': {
         if (action === 'rename_board') board.title = asString(body.title, LIMITS.title, board.title);
@@ -265,7 +446,8 @@ export class BoardService {
         const merged = { ...existing, ...task };
         findNode(board, asString(merged.nodeId, LIMITS.id));
         if (existing) {
-          Object.assign(existing, task, { updatedAt: now });
+          const delivery = Object.hasOwn(task, 'delivery') ? { ...existing.delivery, ...requireObject(task.delivery, 'delivery') } : existing.delivery;
+          Object.assign(existing, task, { delivery, updatedAt: now });
         } else {
           const created = normalizeBoard({ ...board, tasks: [...board.tasks, { ...task, createdAt: now, updatedAt: now }] });
           board.tasks = created.tasks;
@@ -285,7 +467,8 @@ export class BoardService {
         const normalizedTaskId = asString(merged.taskId, LIMITS.id);
         findTask(board, normalizedTaskId);
         if (existing) {
-          Object.assign(existing, todo, { updatedAt: now });
+          const delivery = Object.hasOwn(todo, 'delivery') ? { ...existing.delivery, ...requireObject(todo.delivery, 'delivery') } : existing.delivery;
+          Object.assign(existing, todo, { delivery, updatedAt: now });
         } else {
           const created = normalizeBoard({
             ...board,
@@ -448,6 +631,7 @@ export class BoardService {
         throw new BoardError('STALE_REVISION', `看板已被更新（当前 revision ${board.revision}）`, 409, { revision: board.revision });
       }
       if (commandId && board.applied.some((row) => row.id === commandId)) return { board, workspace, replayed: true, created: [] };
+      const before = plain(board);
       const created = [];
       for (const item of requested) {
         if (!item || typeof item !== 'object') continue;
@@ -511,14 +695,15 @@ export class BoardService {
       board.revision += 1;
       board.updatedAt = isoNow();
       board.updatedBy = actor;
-      if (commandId) {
-        board.applied.unshift({ id: commandId, revision: board.revision, at: board.updatedAt });
-        board.applied = board.applied.slice(0, LIMITS.applied);
-      }
       const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
-      await this.store.write(workspace.path, normalized);
-      this.store.notify({ workspacePath: workspace.path, board: normalized, actor });
-      return { board: normalized, workspace, created };
+      const change = makeHistory(before, plain(normalized), 'dispatch', actor);
+      change.undo.reason = '团队派发会创建外部任务，不支持撤销';
+      normalized.changes.unshift(change);
+      if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
+      const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
+      await this.store.write(workspace.path, committed);
+      this.store.notify({ workspacePath: workspace.path, board: committed, actor });
+      return { board: committed, workspace, created, changeId: change.id, lastChange: committed.changes[0] };
     });
   }
 }

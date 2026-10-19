@@ -58,7 +58,7 @@ function pbEdgePath(source, target, kind) {
   return `M${sx} ${sy} C${c1x} ${sy}, ${c2x} ${ty}, ${tx} ${ty}`;
 }
 
-function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, connectSource, connectPending, connectionHint, onSelectNode, onOpenTask, executionFor, onSelectEdge, onDeleteEdge, onConnectNode, onCreateAt, onMoveNodes, onFit, onLayout, view, setView, onViewport }) {
+function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selectedNodeId, selectedEdgeId, connectMode, connectSource, connectPending, connectionHint, onSelectNode, onOpenTask, executionFor, onSelectEdge, onDeleteEdge, onConnectNode, onCreateAt, onMoveNodes, onFit, onLayout, view, setView, onViewport }) {
   const wrapRef = React.useRef(null);
   const interaction = React.useRef(null);
   const edgeMenuRef = React.useRef(null);
@@ -66,7 +66,11 @@ function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, conne
   const [edgeMenu, setEdgeMenu] = React.useState(null);
   const [deletingEdge, setDeletingEdge] = React.useState(false);
   const [edgeError, setEdgeError] = React.useState('');
-  const [expandedTaskNodes, setExpandedTaskNodes] = React.useState({});
+  const [expandedTaskNodes, setExpandedTaskNodes] = React.useState(() => {
+    const value = pbReadLocal('dsh.project-board.expanded.v1:' + workspacePath, {});
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  });
+  React.useEffect(() => { pbWriteLocal('dsh.project-board.expanded.v1:' + workspacePath, expandedTaskNodes); }, [workspacePath, expandedTaskNodes]);
   const previews = new Map(board.nodes.filter((node) => ['figure', 'milestone', 'component'].includes(node.kind)).map((node) => [node.id, pbCanvasTaskPreview(board, node.id, 3, executionFor, Boolean(expandedTaskNodes[node.id]))]));
   const layout = pbCanvasExpandedLayout(board.nodes, previews);
   React.useLayoutEffect(() => { onLayout?.({ board, nodes: layout.nodes, previews }); });
@@ -269,7 +273,7 @@ function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, conne
             onKeyUp: (event) => { if (event.key === ' ') openEdgeMenu(event, edge); },
           }),
           h('path', {
-            d: edgePath, className: 'pb-edge ' + edge.kind,
+            d: edgePath, className: 'pb-edge ' + edge.kind + (selectedNodeId ? (edge.from === selectedNodeId || edge.to === selectedNodeId ? ' related' : ' unrelated') : ''),
             markerEnd: edge.kind === 'depends' ? 'url(#pb-arrow-dep)' : edge.kind === 'produces' ? 'url(#pb-arrow-prod)' : 'url(#pb-arrow-hier)',
             style: selectedEdgeId === edge.id ? { stroke: PB_ACCENT, strokeWidth: 2.6 } : undefined,
           }));
@@ -289,11 +293,13 @@ function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, conne
       const activityCount = [runningCount ? `运行 ${runningCount}` : '', readyCount ? `可查看 ${readyCount}` : ''].filter(Boolean).join(' · ');
       const linkCount = node.links?.length || 0;
       const teamTask = node.team || null;
+      const resultItems = [node, ...pbNodeTasks(board, node.id).flatMap((task) => [task, ...pbTaskTodos(board, task.id)])];
+      const primary = resultItems.map(pbPrimaryArtifact).find(Boolean);
       const selected = selectedNodeId === node.id;
       const isConnectSource = connecting && connectSource === node.id;
       return h('div', {
         key: node.id,
-        className: 'pb-node' + (hasPreview ? ' pb-node-with-tasks' : '') + (selected ? ' selected' : '') + (dragNode?.id === node.id ? ' dragging' : ''),
+        className: 'pb-node' + (matchNodeIds ? (matchNodeIds.has(node.id) ? ' search-match' : ' search-muted') : '') + (hasPreview ? ' pb-node-with-tasks' : '') + (selected ? ' selected' : '') + (dragNode?.id === node.id ? ' dragging' : ''),
         style: { left: node.x, top: node.y, width: pbCanvasNodeWidth(node), opacity: connecting && !isConnectSource && !selected ? 0.82 : 1, ...(isConnectSource ? { borderColor: PB_ACCENT, boxShadow: `0 0 0 2px color-mix(in srgb, ${PB_ACCENT} 25%, transparent)` } : null) },
         'data-node-id': node.id,
         role: connectMode ? 'button' : undefined, tabIndex: connectMode ? 0 : undefined,
@@ -329,11 +335,11 @@ function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, conne
           const execution = executionFor(task);
           return h('button', {
             key: task.id, type: 'button', className: 'pb-node-task', 'data-preview-task-id': task.id,
-            title: task.title + ' · ' + taskStatus.label + ' · ' + execution.title, 'aria-label': task.title + '，' + execution.label + '，查看任务详情',
+            title: [task.title, taskStatus.label, pbDeliveryLabel(task), task.delivery?.summary, execution.title].filter(Boolean).join(' · '), 'aria-label': task.title + '，' + execution.label + '，查看任务详情',
             disabled: Boolean(connectMode), onPointerDown: (event) => event.stopPropagation(),
             onClick: (event) => { event.stopPropagation(); if (!connectMode) onOpenTask?.(node.id, task.id); },
           }, h('span', { className: 'pb-dot', style: { background: taskStatus.color } }),
-          h('span', { className: 'pb-node-task-title' }, task.title),
+          h('span', { className: 'pb-node-task-title', title: task.delivery?.summary || '' }, task.title, pbDeliveryLabel(task) ? h('span', { className: 'pb-meta', style: { fontSize: 10 } }, ' · ' + pbDeliveryLabel(task)) : null),
           h(PbExecutionBadge, { value: execution }));
         }),
         !preview.visible.length ? h('span', { className: 'pb-meta' }, '当前没有待推进任务') : null)
@@ -349,11 +355,12 @@ function BoardCanvas({ board, selectedNodeId, selectedEdgeId, connectMode, conne
           onClick: (event) => { event.stopPropagation(); if (!connectMode) setExpandedTaskNodes((value) => ({ ...value, [node.id]: !value[node.id] })); },
         }, tasksExpanded ? '收起' : `展开全部 ${preview.tasks.length} 项`, h(PbIcon, { name: tasksExpanded ? 'chevronUp' : 'chevronDown', size: 11 }))
           : h('span', { className: 'pb-chip' }, `全部 ${preview.tasks.length} 项`))
-          : h('span', { className: 'pb-chip' }, `${pbNodeTasks(board, node.id).length} 任务`),
+          : h('span', { className: 'pb-chip' }, `${pbScopeStats(board, node.id).taskCount} 任务`),
+        primary ? h('button', { type: 'button', className: 'pb-chip pb-btn small', title: primary.path, disabled: Boolean(connectMode), onPointerDown: (event) => event.stopPropagation(), onClick: (event) => { event.stopPropagation(); if (!connectMode) onOpenArtifact?.(primary); } }, h(PbIcon, { name: 'file', size: 11 }), '主要成果') : null,
         teamTask ? h('span', { className: 'pb-chip', title: '已派发到 Agent Team' }, h(PbIcon, { name: 'users', size: 11 })) : null,
         linkCount && !hasPreview ? h('span', { className: 'pb-chip' }, h(PbIcon, { name: 'folder', size: 11 }), String(linkCount)) : null,
         hasPreview ? h('span', { className: 'pb-node-done-count', title: `任务完成 ${preview.done}/${preview.tasks.length}；点击任务查看详情` }, activityCount || `已完成 ${preview.done}`)
-          : progress ? h('span', { className: 'pb-chip', style: { marginLeft: 'auto' } }, `${progress.pct}%`) : null),
+          : progress ? h('span', { className: 'pb-chip', style: { marginLeft: 'auto' }, title: `已结束 ${progress.closed}/${progress.total} · 完成 ${progress.done} · 放弃 ${progress.dropped} · 历史 ${progress.historical}` }, `已结束 ${progress.pct}%`) : null),
       progress && !hasPreview ? h('div', { className: 'pb-progress' }, h('span', { style: { width: progress.pct + '%' } })) : null);
     })),
   board.nodes.length === 0 ? h('div', { className: 'pb-empty big', style: { position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', pointerEvents: 'none' } },

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
 
-const source = (await Promise.all(['state.js', 'assistant.js', 'panel.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
+const source = (await fs.readFile(new URL('../board-model.js', import.meta.url), 'utf8')).replace(/^export /gm, '') + '\n' + (await Promise.all(['state.js', 'explorer.js', 'assistant.js', 'panel.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -62,10 +62,11 @@ function harness(componentName, initialProps = {}) {
   };
   React.useLayoutEffect = React.useEffect;
   const requests = [], timers = [], keyListeners = new Set();
+  const storage = new Map([['dsh.project-board.workspace.v1', '/A']]);
   const workspaces = ['/A', '/B'].map(path => ({ path, workspaceId: 'workspace-' + path, hasBoard: true }));
   const globals = {
     React, console,
-    localStorage: { getItem: key => key === 'dsh.project-board.workspace.v1' ? '/A' : null, setItem() {} },
+    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     window: { addEventListener() {}, removeEventListener() {} },
     document: {
       body: { style: {} },
@@ -74,7 +75,7 @@ function harness(componentName, initialProps = {}) {
     },
     setTimeout: callback => { timers.push(callback); return timers.length; }, clearTimeout() {},
     useBoardThreadResults: () => ({}), useBoardJobs: () => ({}), pbItemExecution: () => ({}),
-    pbThreadsOf: item => item?.threads || [],
+    pbThreadsOf: item => item?.threads || [], pbExecutionContext: (board, item) => ({ ids: (item.threads || []).map(row => row.sessionId) }),
     BoardCanvas: function BoardCanvas() {}, PbIcon: function PbIcon() {},
     PbNodeInspector: function PbNodeInspector() {}, PbConversationDrawer: function PbConversationDrawer() {},
     PbArtifactViewer: function PbArtifactViewer() {}, PbEmbeddedConversation: function PbEmbeddedConversation() {},
@@ -98,7 +99,7 @@ function harness(componentName, initialProps = {}) {
     throw new Error('effect 未收敛');
   }
   return {
-    requests, timers, render, get tree() { return tree; },
+    requests, timers, storage, render, get tree() { return tree; },
     keyDown(event) { for (const callback of keyListeners) callback(event); },
     async flush() { await tick(); return render(); },
     unmount() { for (const cell of cells) cell?.cleanup?.(); },
@@ -610,4 +611,28 @@ test('移除最后一个待办自身关联后恢复父会话；相同ID也只移
     assert.equal(named(app.tree, 'PbConversationDrawer').props.sessionId, 'parent');
     assert.deepEqual(app.canvas().props.board.tasks[0].threads, [{ sessionId: 'parent' }]);
   }
+});
+
+
+test('视口按项目恢复与保存，旧项目回调不能污染新视口或存储', async () => {
+  const app = await readyPanel();
+  const initialA = { x: 10, y: 20, scale: .8 }, initialB = { x: -30, y: 50, scale: 1.2 };
+  const key = path => 'dsh.project-board.view.v2:' + path;
+  app.storage.set(key('/A'), JSON.stringify(initialA));
+  app.storage.set(key('/B'), JSON.stringify(initialB));
+  app.canvas().props.onViewport({ width: 900, height: 700 }); app.render();
+  assert.equal(JSON.stringify(app.canvas().props.view), JSON.stringify(initialA));
+  const changeA = app.canvas().props.setView;
+  const finalA = { x: 80, y: -20, scale: .6 };
+  changeA(finalA); app.render();
+  assert.deepEqual(JSON.parse(app.storage.get(key('/A'))), finalA);
+  app.switchTo('/B'); app.render();
+  stateRequests(app).at(-1).resolve({ exists: true, board: board('/B') }); await app.flush();
+  assert.equal(JSON.stringify(app.canvas().props.view), JSON.stringify(initialB));
+  changeA({ x: 999, y: 999, scale: 1 }); app.render();
+  assert.deepEqual(JSON.parse(app.storage.get(key('/A'))), finalA);
+  assert.deepEqual(JSON.parse(app.storage.get(key('/B'))), initialB);
+  app.switchTo('/A'); app.render();
+  stateRequests(app).at(-1).resolve({ exists: true, board: board('/A') }); await app.flush();
+  assert.equal(JSON.stringify(app.canvas().props.view), JSON.stringify(finalA));
 });

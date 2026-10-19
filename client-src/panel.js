@@ -74,6 +74,24 @@ function ProjectBoardPanel(props) {
   const [viewport, setViewport] = React.useState({ width: 0, height: 0 });
   const [nodeModal, setNodeModal] = React.useState(null);
   const [notice, setNotice] = React.useState('');
+  const [viewMode, setViewMode] = React.useState('canvas');
+  const [filters, setFilters] = React.useState({ query: '', branch: '', status: '', kind: '', outcome: '' });
+  const [viewed, setViewed] = React.useState(() => pbReadLocal('dsh.project-board.viewed.v1', {}));
+  const searchRows = pbSearchRows(board, filters);
+  const hasFilters = Object.values(filters).some(Boolean);
+  const matchNodeIds = hasFilters ? new Set(searchRows.map((row) => row.nodeId)) : null;
+  const inboxRows = pbInboxRows(board, sessionsSnap, sessionStatuses);
+  const workspaceSeen = viewed?.[workspacePath] || {};
+  const unreadCount = inboxRows.filter((row) => workspaceSeen[row.id] !== row.version).length;
+  function markViewed(row) {
+    setViewed((current) => {
+      const next = { ...current, [workspacePath]: { ...(current?.[workspacePath] || {}), [row.id]: row.version } };
+      pbWriteLocal('dsh.project-board.viewed.v1', next); return next;
+    });
+  }
+  React.useEffect(() => {
+    if (workspacePath && fittedRef.current === workspacePath && isCurrentWorkspace()) pbWriteLocal('dsh.project-board.view.v2:' + workspacePath, view);
+  }, [workspacePath, view]);
   const [rightTab, setRightTab] = React.useState('assistant');
   const [inspectorTab, setInspectorTab] = React.useState('overview');
   const [dockWidth, setDockWidth] = React.useState(() => {
@@ -139,7 +157,9 @@ function ProjectBoardPanel(props) {
     connectionInFlight.current = false;
     setConnectMode(false); setConnectSource(null); setConnectPending(false); setConnectKind('contains');
     setRightTab('assistant'); setInspectorTab('overview');
-    setView({ x: 40, y: 60, scale: 1 });
+    setView(pbWorkspaceView(path) || { x: 40, y: 60, scale: 1 });
+    setFilters({ query: '', branch: '', status: '', kind: '', outcome: '' });
+    setViewMode('canvas');
   }, []);
 
   const workspace = workspaceItems.find((row) => row.path === workspacePath);
@@ -267,7 +287,8 @@ function ProjectBoardPanel(props) {
   React.useEffect(() => {
     if (board && viewport.width > 600 && viewport.height > 400 && fittedRef.current !== workspacePath) {
       fittedRef.current = workspacePath;
-      fitView(board);
+      const saved = pbWorkspaceView(workspacePath);
+      if (saved) setView(saved); else fitView(board);
     }
   }, [board, viewport.width, viewport.height, workspacePath]);
 
@@ -479,6 +500,25 @@ function ProjectBoardPanel(props) {
     }
   }
 
+  function focusRow(row) {
+    if (!isCurrentWorkspace()) return;
+    const node = (canvasLayout.current?.nodes || boardRef.current?.nodes || []).find((node) => node.id === row.nodeId);
+    if (node) {
+      setViewMode('canvas');
+      setView((value) => ({ ...value, x: viewport.width / 2 - (node.x + pbCanvasNodeWidth(node) / 2) * value.scale, y: viewport.height / 2 - (node.y + 75) * value.scale }));
+      openCanvasTask(node.id, row.taskId);
+    }
+    if (row.kind === 'question' && row.targetId) {
+      const item = (row.targetType === 'todo' ? boardRef.current.todos : boardRef.current.tasks).find((item) => item.id === row.targetId);
+      if (item) { selectThread(row.targetType, item.id, row.sessionId); setConversation({ targetType: row.targetType, targetId: row.targetId }); }
+    } else if (row.type === 'todo' || row.targetType === 'todo') setConversation({ targetType: 'todo', targetId: row.targetId || row.item.id });
+    if (row.kind === 'decision') {
+      setInspectorTab('history');
+      if (!node) setRightTab('history');
+      setTimeout(guardWorkspace(() => document.querySelector('[data-decision-id="' + row.decisionId + '"]')?.scrollIntoView({ block: 'center' })), 40);
+    }
+  }
+  const undoChange = (changeId) => runCommand('undo_change', { changeId }, { throwOnError: true });
   const connectionType = PB_CONNECTION_TYPES[connectKind];
   const connectionSourceTitle = board?.nodes.find((node) => node.id === connectSource)?.title;
   const connectionHint = connectPending ? '正在保存连线…' : connectionSourceTitle
@@ -529,8 +569,11 @@ function ProjectBoardPanel(props) {
         h('button', { className: 'pb-btn primary', disabled: busy, onClick: () => runCommand('create_board', {}) }, '创建看板')));
   } else {
     body = h('div', { className: 'pb-body', ref: bodyRef },
-      h(BoardCanvas, {
+      h('div', { className: 'pb-stage' },
+      h('div', { className: 'pb-stage-canvas', style: viewMode === 'list' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined, 'aria-hidden': viewMode === 'list' }, h(BoardCanvas, {
         key: workspacePath,
+        workspacePath, matchNodeIds,
+        onOpenArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })),
         board,
         selectedNodeId,
         selectedEdgeId,
@@ -551,7 +594,8 @@ function ProjectBoardPanel(props) {
         view,
         setView: guardWorkspace(setView),
         onViewport: guardWorkspace(setViewport),
-      }),
+      })),
+      viewMode === 'list' ? h(PbBoardList, { board, rows: searchRows, onOpen: focusRow, onArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })) }) : null),
       h('div', { className: 'pb-dock-resizer', role: 'separator', 'aria-orientation': 'vertical', 'aria-label': '拖动调整右栏宽度', tabIndex: 0, 'aria-valuemin': 0, 'aria-valuemax': Math.max(0, bodyWidth - 7), 'aria-valuenow': Math.round(renderedDockWidth), title: '拖动调整宽度（双击恢复默认）',
         onPointerDown: onDockResizeStart, onPointerMove: onDockResizeMove, onPointerUp: onDockResizeEnd, onPointerCancel: onDockResizeEnd,
         onKeyDown: (event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); setDockWidth((width) => clampDock(width + (event.key === 'ArrowLeft' ? 20 : -20))); } },
@@ -567,9 +611,10 @@ function ProjectBoardPanel(props) {
           sessionsSnapshot: sessionsSnap, runCommand,
           onClose: guardWorkspace(() => { setConversation(null); setRightTab('inspector'); setInspectorTab('overview'); }), onOpenSession: guardWorkspace((id) => props.openSession(id, isCurrentWorkspace)),
           onSelectThread: selectThread, onCreateThread: createThread, onRemoveThread: removeThread,
+          onOpenArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })),
           acquireConversationSession: props.acquireConversationSession, initializeDraft: props.initializeDraft,
           SessionProvider: props.SessionProvider, renderSlot: props.renderSlot, workspaceFiles: props.workspaceFiles,
-        }) : rightTab === 'assistant' ? h(BoardAssistant, {
+        }) : rightTab === 'inbox' ? h(PbInbox, { rows: inboxRows, seen: workspaceSeen, onSeen: markViewed, onOpen: focusRow }) : rightTab === 'history' ? h(PbBoardChangeHistory, { board, onUndo: undoChange, runCommand }) : rightTab === 'assistant' ? h(BoardAssistant, {
           key: workspacePath,
           isCurrentWorkspace,
           board,
@@ -588,6 +633,9 @@ function ProjectBoardPanel(props) {
           workspacePath,
           sessionsSnapshot: sessionsSnap,
           runCommand,
+          onUndoChange: undoChange,
+          parentCandidates: board.nodes.filter((candidate) => !pbScopeStats(board, selectedNode.id).nodeIds.includes(candidate.id)).map((row) => ({ id: row.id, title: row.title })),
+          onReparentNode: (parentId) => runCommand('__connect_nodes', { source: parentId, target: selectedNode.id, kind: 'contains' }, { throwOnError: true }),
           onOpenTodo: guardWorkspace((id) => setConversation({ targetType: 'todo', targetId: id })),
           threadUi, tab: inspectorTab, onTabChange: guardWorkspace(setInspectorTab), executionFor,
           taskFocus: taskFocus?.workspacePath === workspacePath && taskFocus.nodeId === selectedNode.id ? taskFocus : null,
@@ -600,6 +648,7 @@ function ProjectBoardPanel(props) {
 
   return h('main', { className: 'pb-page', 'data-project-board': '', 'aria-label': '项目看板' },
     header,
+    board ? h(PbBoardToolbar, { board, filters, onFilters: guardWorkspace(setFilters), mode: viewMode, onMode: guardWorkspace(setViewMode), inboxCount: unreadCount, onInbox: guardWorkspace(() => { setConversation(null); setRightTab('inbox'); if (renderedDockWidth < 260) setDockWidth(400); }), onHistory: guardWorkspace(() => { setConversation(null); setRightTab('history'); if (renderedDockWidth < 260) setDockWidth(400); }) }) : null,
     notice ? h('div', { className: 'pb-toast', onClick: () => setNotice('') }, h(PbIcon, { name: 'check', size: 13 }), notice) : null,
     error ? h('div', { className: 'pb-error', role: 'alert', onClick: guardWorkspace(() => setError('')) }, error) : null,
     busy ? h('div', { className: 'pb-busy' }, '保存中…') : null,

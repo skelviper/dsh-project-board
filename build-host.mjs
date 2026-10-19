@@ -8,13 +8,14 @@ import { spawnSync } from 'node:child_process';
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const version = process.argv[2] || JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
 if (!/^[A-Za-z0-9._-]+$/.test(version)) throw new Error('Invalid build version');
-const parts = ['schema.mjs', 'store.mjs', 'service.mjs', 'thread.mjs', 'index.mjs'];
+const parts = ['board-model.js', 'schema.mjs', 'store.mjs', 'service.mjs', 'thread.mjs', 'index.mjs'];
 const header = [
   "import fs from 'node:fs';",
   "import fsp from 'node:fs/promises';",
   "import path from 'node:path';",
   "import { createRequire } from 'node:module';",
   "import { pathToFileURL } from 'node:url';",
+  "import { isDeepStrictEqual } from 'node:util';",
   '',
 ].join('\n');
 

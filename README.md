@@ -2,7 +2,7 @@
 
 A project board for DSH Web: one independent board per workspace, with a draggable canvas, tasks, todos, linked DSH conversations, and Agent Team dispatch.
 
-Version **0.1.0** · **MIT** · **Chinese UI**. This standalone repository contains the plugin source copied through an explicit file allowlist. It includes no live workspace boards, conversation histories, or project screenshots.
+Version **0.2.0** · **MIT** · **Chinese UI**. This standalone repository contains the plugin source copied through an explicit file allowlist. It includes no live workspace boards, conversation histories, or project screenshots.
 
 ## Features
 
@@ -12,6 +12,10 @@ Version **0.1.0** · **MIT** · **Chinese UI**. This standalone repository conta
 - Give agents a board summary in their runtime context; use `project_board_get`, `project_board_update`, and `project_board_dispatch` to coordinate planning and execution.
 - Preview workspace files and folders in place, including text, code, JSON, images, PDF, and rendered Markdown.
 - Create a separate empty board for each registered workspace. Data stays in that workspace at `board/project-board.json`.
+- Review a needs-attention inbox, search a list of work items, and filter by branch, status, node kind, or delivery outcome.
+- Record delivery summaries, review decisions, and a primary artifact independently of acceptance requirements.
+- Inspect bounded change history and undo individual changes when their fields and relationships still match.
+- Use consistent descendant and leaf-work statistics across the canvas, lists, and agent summaries.
 
 Node kinds include `theme`, `milestone`, `component`, `document`, `experiment`, `figure`, `manuscript`, `infra`, and `historical`. The original kinds remain available alongside the three general-purpose additions.
 
@@ -56,10 +60,10 @@ Once DSH Web has loaded the plugin, refresh its existing page. Open **看板** (
 With the required Agent Team bundle enabled, install the tagged release directly:
 
 ```sh
-dsh plugin --profile web add github:skelviper/dsh-project-board#v0.1.0
+dsh plugin --profile web add github:skelviper/dsh-project-board#v0.2.0
 ```
 
-Source and release assets are available from [skelviper/dsh-project-board](https://github.com/skelviper/dsh-project-board) and its [v0.1.0 release](https://github.com/skelviper/dsh-project-board/releases/tag/v0.1.0). For an offline plugin archive, download `dsh-project-board-0.1.0.tgz` and pass its absolute path to the same `dsh plugin --profile web add` command.
+Source and release assets are available from [skelviper/dsh-project-board](https://github.com/skelviper/dsh-project-board) and its [v0.2.0 release](https://github.com/skelviper/dsh-project-board/releases/tag/v0.2.0). For an offline plugin archive, download `dsh-project-board-0.2.0.tgz` and pass its absolute path to the same `dsh plugin --profile web add` command.
 
 ### Migrate an existing manual installation
 
@@ -68,7 +72,7 @@ Source and release assets are available from [skelviper/dsh-project-board](https
 3. Build and install this package with the standard command above. Keep exactly one active project-board registration, then restart the DSH Web service and refresh its page.
 4. Open the existing workspace and confirm its board and linked sessions. The board location and schema version remain the same; the old single-session `thread` field is normalized to `threads` when read.
 
-Installing this package does not copy boards or session histories. Boards remain in their workspaces, while the referenced sessions remain in DSH storage. Loading both installations can duplicate routes, tools, and UI entries.
+Installing this package does not copy boards or session histories. Boards remain in their workspaces, while the referenced sessions remain in DSH storage. Loading both installations can duplicate routes, tools, and UI entries. Back up before upgrading: although the schema number remains 1, a 0.1.x writer does not preserve the delivery and history fields added in 0.2.0. Do not downgrade a live board or run old and new writers concurrently.
 
 ## Maintain and build
 
@@ -86,7 +90,7 @@ After host changes, restart DSH Web to clear the ESM module cache. After browser
 
 ## Validation
 
-The standalone source passes 92 automated tests on Node.js 24, including independent workspaces with identical entity and command IDs, explicit cross-workspace digest reads, artifact path boundaries, and reproducible builds from paths containing spaces and Unicode. The DSH `0.2.1-rc.2` profile loader also composes the bundle once and its real tool definitions register all three tools and seven routes. The CI configuration covers Node.js 22 and 24; those hosted jobs run after the repository is published.
+The standalone source passes 140 automated tests on Node.js 24, including independent workspaces with identical entity and command IDs, explicit cross-workspace digest reads, artifact path boundaries, conflict-checked undo, shared progress statistics, delivery forms, general-purpose node previews, and reproducible builds from paths containing spaces and Unicode. The DSH `0.2.1-rc.2` profile loader also composes the bundle once and its real tool definitions register all three tools and seven routes. CI checks Node.js 22 and 24; pushed version tags publish release archives only after both checks pass.
 
 These checks use isolated temporary projects. The extracted release has not replaced an existing live installation or received a new browser acceptance run.
 

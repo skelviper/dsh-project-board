@@ -181,7 +181,7 @@ function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, init
 }
 
 // 当前会话由父组件持有；原生输入框直接保留草稿和附件，完整会话仅导航到同一 ID。
-function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task, node, targetType, sessionId, sessionsSnapshot, onClose, onOpenSession, onSelectThread, onCreateThread, onRemoveThread, runCommand, acquireConversationSession, initializeDraft, SessionProvider, renderSlot }) {
+function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task, node, targetType, sessionId, sessionsSnapshot, onClose, onOpenSession, onSelectThread, onCreateThread, onRemoveThread, runCommand, onOpenArtifact, acquireConversationSession, initializeDraft, SessionProvider, renderSlot }) {
   const [error, setError] = React.useState('');
   const [opening, setOpening] = React.useState(false);
   const label = targetType === 'task' ? '任务' : '待办';
@@ -228,15 +228,17 @@ function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task
       h('button', { type: 'button', className: 'pb-btn primary', onClick: () => onCreateThread(targetType, item.id).catch((err) => setError(err.message)) }, '新建会话')),
     h('div', { className: 'pb-drawer-foot' },
       error ? h('div', { className: 'pb-conversation-error', role: 'alert' }, error) : null,
+      h('details', { className: 'pb-context' }, h('summary', null, '交付与验收' + (pbDeliveryLabel(item) ? ' · ' + pbDeliveryLabel(item) : '')), h(PbDeliveryEditor, { key: targetType + ':' + item.id, item, targetType, runCommand, onOpenArtifact })),
       h('div', { className: 'pb-drawer-actions' },
         h('button', { type: 'button', className: 'pb-btn', disabled: !sessionId || opening, onClick: openFullSession }, opening ? '正在打开…' : '打开完整会话'),
         h('button', { type: 'button', className: 'pb-btn', onClick: () => runCommand(targetType === 'task' ? 'upsert_task' : 'upsert_todo', { [targetType]: { id: item.id, status: item.status === 'done' ? 'todo' : 'done' } }) }, item.status === 'done' ? '重新打开' : '标记完成'),
         h('button', { type: 'button', className: 'pb-btn danger', onClick: () => { if (window.confirm(`删除这个${label}？${targetType === 'task' ? '关联待办会一并删除；' : ''}会话记录会保留。`)) void runCommand(targetType === 'task' ? 'delete_task' : 'delete_todo', { id: item.id }); } }, '删除' + label)),
       notes.length ? h('details', { className: 'pb-context pb-context-notes' },
         h('summary', null, '条目备注（' + notes.length + '）'),
-        ...notes.map((row) => h('div', { key: row.id, className: 'pb-row' }, h('span', { className: 'pb-row-text' }, row.text),
+        ...notes.map((row) => h('div', { key: row.id, className: 'pb-row' }, h('div', { className: 'pb-row-text' }, h(PbExpandableText, { text: row.text })),
           h('button', { type: 'button', className: 'pb-icon-btn', title: '删除备注', onClick: () => runCommand('delete_note', { id: row.id }) }, h(PbIcon, { name: 'trash', size: 12 }))))
       ) : null,
+      h('details', { className: 'pb-context' }, h('summary', null, '条目变更历史'), h(PbChangeHistory, { key: targetType + ':' + item.id, board, targetType, targetId: item.id, onUndoChange: (changeId) => runCommand('undo_change', { changeId }, { throwOnError: true }) })),
       h(PbQuickAdd, { placeholder: '添加备注…（回车保存）', label: '加备注',
         onSubmit: (text) => runCommand('add_note', { targetType, targetId: item.id, text, author: '我' }) })));
 }

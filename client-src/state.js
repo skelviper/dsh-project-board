@@ -182,25 +182,18 @@ function pbDerivedNodeStatus(board, nodeId) {
   const node = board?.nodes?.find((row) => row.id === nodeId);
   if (!node) return 'todo';
   if (node.kind === 'historical') return 'historical';
-  if (node.kind === 'theme') return node.status || 'todo';
-  const tasks = pbNodeTasks(board, nodeId);
-  if (!tasks.length) return node.status || 'todo';
-  if (tasks.some((task) => task.status === 'doing' || task.status === 'active')) return 'doing';
-  if (tasks.some((task) => task.status === 'blocked' || task.status === 'deferred')) return 'blocked';
-  if (tasks.every((task) => task.status === 'done' || task.status === 'dropped')) return 'done';
+  const stats = pbScopeStats(board, nodeId);
+  if (!stats.total) return node.status || 'todo';
+  if (stats.doing) return 'doing';
+  if (stats.blocked) return 'blocked';
+  if (stats.deferred) return 'deferred';
+  if (stats.closed === stats.total) return stats.done ? 'done' : stats.dropped ? 'dropped' : 'historical';
   return 'todo';
 }
 
 function pbNodeProgress(board, nodeId) {
-  const tasks = pbNodeTasks(board, nodeId);
-  if (!tasks.length) return null;
-  // 按末级条目计数：有待办时计待办，没有待办的任务自身也必须计入。
-  const rows = tasks.flatMap((task) => {
-    const todos = pbTaskTodos(board, task.id);
-    return todos.length ? todos : [task];
-  });
-  const done = rows.filter((row) => row.status === 'done' || row.status === 'dropped').length;
-  return { done, total: rows.length, pct: rows.length ? Math.round((done / rows.length) * 100) : 0 };
+  const stats = pbScopeStats(board, nodeId);
+  return stats.total ? stats : null;
 }
 
 function pbTeamTask(board, claim) {

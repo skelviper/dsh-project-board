@@ -1,6 +1,6 @@
 # Usage guide
 
-`dsh-project-board` 0.1.0 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
+`dsh-project-board` 0.2.0 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
 
 ## Create a board for a workspace
 
@@ -63,7 +63,23 @@ Use **派发** (Dispatch) on a task, or ask the Board Lead to dispatch a task or
 
 Dispatch creates an Agent Team task and stores a reference on the board item. The board reads current team ownership and execution state from DSH's session projections. The board's planning status remains a separate record that agents or users should update after reviewing progress and acceptance criteria.
 
-Task and todo statuses are `todo`, `doing`, `blocked`, `done`, and `dropped`. Execution badges include **运行中** (Running), **可查看** (Result available), **待你处理** (Needs your input), **待运行/待继续** (Waiting to run or continue), and **需检查** (Needs inspection). A result being available is a reason to inspect it, not evidence that the task meets its acceptance criteria. Linking a conversation does not start or complete an item.
+Task and todo statuses are `todo`, `doing`, `blocked`, `done`, `deferred`, `dropped`, and `historical`. Execution badges include **运行中** (Running), **可查看** (Result available), **待你处理** (Needs your input), **待运行/待继续** (Waiting to run or continue), and **需检查** (Needs inspection). A result being available is a reason to inspect it, not evidence that the task meets its acceptance criteria. Linking a conversation does not start or complete an item.
+
+## Attention, deliveries, and change history
+
+The **待我处理** (Needs my attention) inbox combines linked conversations waiting for input, unresolved questions, explicitly submitted deliveries, and blocked work. A normal conversation reply does not create a review request. Marking an entry as viewed is browser-local; accepting or requesting changes is a separate saved review decision.
+
+**画布 / 列表** (Canvas / List) share search and filters for branch, progress status, node kind, and delivery outcome. Search includes titles, requirements, delivery summaries, artifact paths, and linked conversations. Choosing a list item locates its node and task. Unassigned nodes have their own filter; reparenting remains an explicit edit. Viewport and expanded-card state are stored separately for each workspace.
+
+`acceptance` holds the requirement. Record the actual result in `delivery.summary`, with an independent `delivery.outcome` of `unspecified`, `supported`, `not_supported`, `not_triggered`, or `inconclusive`. These outcomes do not change task progress. `delivery.review` is `none`, `pending`, `accepted`, or `changes_requested`; **提交验收** (Submit for review) explicitly sets `pending` and an ISO `submittedAt` timestamp. Existing entries begin unspecified rather than inferring a result from older text.
+
+Select `primaryArtifactPath` from the item's registered artifact paths, or clear it. The primary-artifact shortcut reuses the existing file preview. Long requirements and notes show a summary with an option to expand their original text.
+
+Statistics include a node itself and every descendant reached through `contains` edges, with each task and todo counted once. A task with todos contributes its todos; a task without todos contributes itself. **完成** (Done) counts only `done`; **已结束** (Closed) includes `done`, `dropped`, and `historical`. Closure percentage describes workflow progress and does not imply that a hypothesis was supported.
+
+The **变更** (Changes) view and item history show actor, time, affected entries, and eligible undo actions. Call `project_board_update` with `action: "undo_change"` and `input: {"changeId": "…"}` to undo one change. Undo restores only the original fields and first checks their current values, entry identity, and relationships; any conflict rejects the entire undo. Cascaded data from a node or task deletion can be restored together. Session associations, team dispatch, and other external actions cannot be undone.
+
+History is stored in `changes[]` within the same board, bounded to 80 records and 2 MiB. Large changes retain a summary without undo data. History is recorded for new operations; old operations cannot be reconstructed retroactively. History can retain deleted content and its actor until it ages out, so deleting an item does not immediately erase its history. These records are project data and must not be included when sharing the plugin source.
 
 ## Preview artifacts and source files
 
@@ -122,17 +138,18 @@ For session bindings, use `action: "bind_thread"` with `input` containing exactl
 
 ## Stored data model
 
-The schema version is `1`; the package version is `0.1.0`. The main structures are:
+The schema version remains `1`; the package version is `0.2.0`. The main structures are:
 
 ```text
 board:  { version, revision, workspacePath, title, nodes[], edges[], tasks[],
-          todos[], decisions[], notes[], assistant?, applied[], timestamps… }
+          todos[], decisions[], notes[], changes[], assistant?, applied[], timestamps… }
 node:   { id, kind, title, summary, status, x, y, w, links[], derivedFrom[], tags[] }
 edge:   { id, from, to, kind: contains|depends|produces, label }
 task:   { id, nodeId, title, status, owner, acceptance, blockedBy[],
-          writeScopes[], artifacts[], threads[], team?, order }
+          writeScopes[], artifacts[], primaryArtifactPath, delivery, threads[], team?, order }
 todo:   { id, taskId, title, status, owner, acceptance, artifacts[],
-          threads[], team?, order }
+          primaryArtifactPath, delivery, threads[], team?, order }
+delivery: { summary, outcome, review, submittedAt }
 thread: { sessionId, title, createdAt, updatedAt }
 team:   { leadSessionId, taskId, ownerName?, status?, revision?, linkedAt }
 ```

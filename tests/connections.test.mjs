@@ -4,13 +4,13 @@ import fs from 'node:fs/promises';
 import vm from 'node:vm';
 import { BoardService } from '../service.mjs';
 
-const source = (await Promise.all(['state.js', 'canvas.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
+const source = (await fs.readFile(new URL('../board-model.js', import.meta.url), 'utf8')).replace(/^export /gm, '') + '\n' + (await Promise.all(['state.js', 'explorer.js', 'canvas.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
 const React = {
   createElement(type, props, ...children) { return { type, props: props || {}, children }; },
   useRef(value) { return { current: value }; }, useState(value) { return [value, () => {}]; },
   useEffect() {}, useLayoutEffect() {},
 };
-const { pbPlanConnection, pbNodeBranchPath, BoardCanvas } = vm.runInNewContext(`(() => { ${source}; return { pbPlanConnection, pbNodeBranchPath, BoardCanvas }; })()`, { React });
+const { pbPlanConnection, pbNodeBranchPath, BoardCanvas } = vm.runInNewContext(`(() => { ${source}; return { pbPlanConnection, pbNodeBranchPath, BoardCanvas }; })()`, { React, PbExecutionBadge: function PbExecutionBadge() {} });
 const fixture = () => ({
   nodes: [{ id: 'a', title: '探索性实验', kind: 'theme', x: 20, y: 30 }, { id: 'b', title: 'baseline', kind: 'theme', x: 320, y: 30 }, { id: 'c', title: '新节点', kind: 'experiment', x: 40, y: 230 }, { id: 'd', title: '下一级', kind: 'experiment', x: 60, y: 400 }],
   edges: [{ id: 'old', from: 'a', to: 'c', kind: 'contains', createdAt: '2026-10-19T00:00:00Z' }, { id: 'sub', from: 'c', to: 'd', kind: 'contains' }, { id: 'dep', from: 'c', to: 'b', kind: 'depends' }],
@@ -93,4 +93,68 @@ test('卡片Enter和Space各激活一次，忽略repeat、子控件及pending', 
   const waiting = cards({ connectPending: true });
   waiting.rows[0].props.onClick(event()); waiting.rows[0].props.onKeyDown(event('Enter')); waiting.rows[0].props.onKeyUp(event(' '));
   assert.deepEqual(waiting.calls, []);
+});
+
+function canvasRows(tree) {
+  if (!tree || typeof tree !== 'object') return [];
+  if (Array.isArray(tree)) return tree.flatMap(canvasRows);
+  return [tree, ...(tree.children || []).flatMap(canvasRows)];
+}
+const canvasText = tree => typeof tree === 'string' ? tree : Array.isArray(tree) ? tree.map(canvasText).join('') : tree && typeof tree === 'object' ? canvasText(tree.children) : '';
+function genericBoard() {
+  const kinds = ['figure', 'milestone', 'component', 'document'];
+  const nodes = kinds.map((kind, index) => ({ id: kind, kind, title: kind, x: index * 320, y: 0, w: 305 }));
+  return { nodes, edges: [], tasks: kinds.slice(0, 3).flatMap(kind => Array.from({ length: 4 }, (_, index) => ({ id: kind + '-' + index, nodeId: kind, title: kind + ' task ' + index, status: 'todo' }))), todos: [] };
+}
+
+test('通用里程碑和模块保留三项任务预览与宽度，图例按实际类型生成', () => {
+  const { rows } = cards({ board: genericBoard(), connectMode: false });
+  for (const kind of ['figure', 'milestone', 'component']) {
+    const card = rows.find(row => row.props['data-node-id'] === kind);
+    assert.equal(card.props.style.width, 305);
+    assert.equal(canvasRows(card).filter(row => row.props?.['data-preview-task-id']).length, 3);
+    assert.ok(canvasRows(card).some(row => row.props?.['aria-label'] === `展开${kind}全部 4 项任务`));
+  }
+  assert.equal(rows.find(row => row.props['data-node-id'] === 'document').props.style.width, 230);
+  const tree = BoardCanvas({ board: genericBoard(), view: { x: 0, y: 0, scale: 1 }, executionFor: () => ({ kind: 'idle' }) });
+  const legend = canvasRows(tree).find(row => row.props?.className === 'pb-legend');
+  for (const label of ['主题', '图', '里程碑', '模块', '文档']) assert.match(canvasText(legend), new RegExp(label));
+  assert.doesNotMatch(canvasText(legend), /实验|文稿/);
+});
+
+function persistentCanvas(board, workspacePath, storage) {
+  const slots = [];
+  let cursor = 0, effects = [];
+  const react = {
+    createElement: React.createElement,
+    useState(initial) { const at = cursor++; if (!slots[at]) slots[at] = { value: typeof initial === 'function' ? initial() : initial }; return [slots[at].value, next => { slots[at].value = typeof next === 'function' ? next(slots[at].value) : next; }]; },
+    useRef(initial) { const at = cursor++; return slots[at] ||= { current: initial }; },
+    useEffect(effect, dependencies) {
+      const at = cursor++;
+      if (!dependencies || !slots[at] || dependencies.some((value, index) => !Object.is(value, slots[at][index]))) { slots[at] = dependencies; effects.push(effect); }
+    },
+  };
+  react.useLayoutEffect = react.useEffect;
+  const renderCanvas = vm.runInNewContext(source + '\nBoardCanvas;', {
+    React: react, PbExecutionBadge: function PbExecutionBadge() {},
+    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+  });
+  return () => {
+    cursor = 0; effects = [];
+    const tree = renderCanvas({ board, workspacePath, view: { x: 0, y: 0, scale: 1 }, executionFor: () => ({ kind: 'idle' }) });
+    for (const effect of effects) effect();
+    return tree;
+  };
+}
+
+test('通用节点展开按项目恢复，另一项目独立，保存的节点位置不变', () => {
+  const board = genericBoard(), before = structuredClone(board), storage = new Map();
+  const render = persistentCanvas(board, '/project-a', storage);
+  const toggle = canvasRows(render()).find(row => row.props?.['aria-label'] === '展开milestone全部 4 项任务');
+  toggle.props.onClick(event());
+  const milestoneTasks = tree => canvasRows(tree).filter(row => row.props?.['data-preview-task-id']?.startsWith('milestone-')).length;
+  assert.equal(milestoneTasks(render()), 4);
+  assert.equal(milestoneTasks(persistentCanvas(board, '/project-a', storage)()), 4);
+  assert.equal(milestoneTasks(persistentCanvas(board, '/project-b', storage)()), 3);
+  assert.deepEqual(board, before);
 });

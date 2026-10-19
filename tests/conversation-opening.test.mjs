@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
 
-const source = (await Promise.all(['state.js', 'conversations.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
+const source = (await Promise.all(['state.js', 'explorer.js', 'inspector.js', 'conversations.js'].map(name => fs.readFile(new URL('../client-src/' + name, import.meta.url), 'utf8')))).join('\n');
 function harness(component, props) {
   const cells = []; let index = 0;
   const React = {

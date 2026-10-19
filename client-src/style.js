@@ -287,7 +287,7 @@ const PB_CSS = `
 function pbInjectStyle(ctx) {
   const style = document.createElement('style');
   style.dataset.plugin = 'project-board';
-  style.textContent = PB_CSS;
+  style.textContent = PB_CSS + PB_EXPLORER_CSS + PB_DELIVERY_CSS;
   document.head.appendChild(style);
   if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => style.remove());
 }

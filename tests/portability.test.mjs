@@ -87,7 +87,7 @@ test('build scripts work in paths with spaces and Unicode and produce reproducib
   });
   const target = path.join(dir, '源码 with spaces');
   await fs.mkdir(target);
-  for (const name of ['package.json', 'build-host.mjs', 'build-client.mjs', 'board-model.js', 'schema.mjs', 'store.mjs', 'service.mjs', 'thread.mjs', 'index.mjs']) await fs.copyFile(new URL(name, root), path.join(target, name));
+  for (const name of ['package.json', 'build-host.mjs', 'build-client.mjs', 'board-model.js', 'schema.mjs', 'store.mjs', 'maintenance-files.mjs', 'maintenance.mjs', 'service.mjs', 'thread.mjs', 'conversation-context.mjs', 'index.mjs']) await fs.copyFile(new URL(name, root), path.join(target, name));
   await fs.cp(new URL('client-src/', root), path.join(target, 'client-src'), { recursive: true });
   for (const name of ['build-host.mjs', 'build-client.mjs']) {
     const result = spawnSync(process.execPath, [path.join(target, name)], { encoding: 'utf8' });

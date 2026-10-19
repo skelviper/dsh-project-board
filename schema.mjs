@@ -1,8 +1,9 @@
 // Board schema, normalisation, and command validation for dsh-project-board.
 // The board file lives at <workspace>/board/project-board.json and is owned by
-// this plugin; workspace project files are never mutated.
+// this plugin; explicit board deletions may archive owned workspace outputs.
 
 import { pbNodeIdsInScope, pbScopeStats, pbShortSummary } from './board-model.js';
+import { normalizeMaintenance } from './maintenance.mjs';
 
 export const BOARD_VERSION = 1;
 export const BOARD_RELATIVE_PATH = 'board/project-board.json';
@@ -143,6 +144,7 @@ function normalizeNode(raw, now) {
     y: asNumber(raw.y, 0),
     w: asNumber(raw.w, 240, 140, 520),
     links: normalizeLinks(raw.links),
+    ownedPaths: Array.isArray(raw.ownedPaths) ? [...new Set(raw.ownedPaths.map(v => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 40) : [],
     derivedFrom: Array.isArray(raw.derivedFrom) ? raw.derivedFrom.map((v) => asString(v, LIMITS.path)).filter(Boolean).slice(0, 30) : [],
     tags: Array.isArray(raw.tags) ? raw.tags.map((v) => asString(v, 60)).filter(Boolean).slice(0, 20) : [],
     collapsed: asBool(raw.collapsed),
@@ -192,6 +194,7 @@ function normalizeTask(raw, now) {
     blockedBy: Array.isArray(raw.blockedBy) ? [...new Set(raw.blockedBy.map((v) => asString(v, LIMITS.id)).filter(Boolean))].slice(0, 40) : [],
     writeScopes: Array.isArray(raw.writeScopes) ? [...new Set(raw.writeScopes.map((v) => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 20) : [],
     artifacts: normalizeArtifacts(raw.artifacts),
+    ownedPaths: Array.isArray(raw.ownedPaths) ? [...new Set(raw.ownedPaths.map(v => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 40) : [],
     threads: normalizeThreads(raw, now),
     team: normalizeTeam(raw.team, now),
     order: Number.isFinite(raw.order) ? Math.trunc(raw.order) : 0,
@@ -241,6 +244,7 @@ function normalizeTodo(raw, now) {
     threads,
     team: normalizeTeam(raw.team, now),
     artifacts: normalizeArtifacts(raw.artifacts),
+    ownedPaths: Array.isArray(raw.ownedPaths) ? [...new Set(raw.ownedPaths.map(v => asString(v, LIMITS.path)).filter(Boolean))].slice(0, 40) : [],
     createdAt: asIso(raw.createdAt, now),
     updatedAt: asIso(raw.updatedAt, now),
   };
@@ -398,6 +402,7 @@ export function normalizeBoard(raw, options = {}) {
     applied,
     changes: normalizeChanges(source.changes, now),
     ...(assistant ? { assistant } : {}),
+    ...(source.maintenance ? { maintenance: normalizeMaintenance(source.maintenance) } : {}),
   };
 }
 
@@ -413,6 +418,10 @@ export function boardDigest(board, { workspacePath, teamTasks, sessionId } = {})
   const tasksById = new Map(board.tasks.map((task) => [task.id, task]));
   const statusCount = (stats) => `${stats.doing} 进行 / ${stats.blocked} 受阻 / ${stats.done} 完成 / ${stats.todo} 待办 / ${stats.deferred} 暂缓 / ${stats.dropped} 放弃 / ${stats.historical} 历史；已结束 ${stats.closed}/${stats.total}（${stats.pct}%）`;
   const lines = [];
+  if (board.maintenance) {
+    const open = board.maintenance.conflicts.filter(c => c.status === 'open').length;
+    lines.push(`看板维护：${board.maintenance.lastScanAt || '尚未扫描'}；${open} 个冲突需决定。用project_board_maintain读取/更新；删除标记不能复活。`);
+  }
   // 同一会话可绑定多个任务和待办；优先显示全部匹配，避免只识别首个待办。
   const inSession = (row) => sessionId && (row.threads || []).some((thread) => thread.sessionId === sessionId);
   const boundTasks = board.tasks.filter(inSession);

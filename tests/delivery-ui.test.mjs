@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import { BoardService } from '../service.mjs';
 
 const source = fs.readFileSync(new URL('../board-model.js', import.meta.url), 'utf8').replace(/^export /gm, '') + '\n' + ['state.js', 'inspector.js'].map(name => fs.readFileSync(new URL('../client-src/' + name, import.meta.url), 'utf8')).join('\n');
 const exported = '({ PbDeliveryEditor, PbExpandableText, PbNodeMembership, PbChangeHistory, PbNodeInspector, PbTaskRow })';
@@ -80,9 +81,9 @@ test('旧验收文本不迁移、不推断结果；只提交显式修改的deliv
   assert.equal(field(f.tree, '验收状态').props.value, 'none');
   await f.submit(); assert.equal(calls.length, 0);
   f.change('交付结论', '本次显式结论'); await f.submit();
-  assert.deepEqual(calls[0], ['upsert_task', { task: { id: 't1', delivery: { summary: '本次显式结论' } } }, { throwOnError: true }]);
+  assert.deepEqual(calls[0], ['upsert_task', { task: { id: 't1', delivery: { summary: '本次显式结论' } }, base: { delivery: { summary: '' } } }, { throwOnError: true }]);
   f.change('验收标准', '新标准'); await f.submit();
-  assert.deepEqual(calls[1][1], { task: { id: 't1', acceptance: '新标准' } });
+  assert.deepEqual(calls[1][1], { task: { id: 't1', acceptance: '新标准' }, base: { acceptance: '完成且未通过可靠性门' } });
 });
 
 test('完整结果与验收选项独立，待办写入todo且无完成状态副作用', async () => {
@@ -95,7 +96,7 @@ test('完整结果与验收选项独立，待办写入todo且无完成状态副�
     ['none', '未提交'], ['pending', '待验收'], ['accepted', '已验收'], ['changes_requested', '需修改'],
   ]);
   f.change('结果标签', 'not_triggered'); f.change('验收状态', 'accepted'); await f.submit();
-  assert.deepEqual(calls[0][1], { todo: { id: 'd1', delivery: { outcome: 'not_triggered', review: 'accepted' } } });
+  assert.deepEqual(calls[0][1], { todo: { id: 'd1', delivery: { outcome: 'not_triggered', review: 'accepted' } }, base: { delivery: { outcome: 'unspecified', review: 'none' } } });
 });
 
 test('失败保留草稿与明确冲突提示，重试成功后关闭未保存标记', async () => {
@@ -140,7 +141,7 @@ test('同记录远端更新只同步未编辑字段，保存不回写远端字�
   assert.equal(field(f.tree, '验收标准').props.value, '远端标准');
   assert.equal(field(f.tree, '交付结论').props.value, '本地草稿');
   assert.equal(field(f.tree, '验收状态').props.value, 'pending');
-  await f.submit(); assert.deepEqual(calls[0][1], { task: { id: 'a', delivery: { summary: '本地草稿' } } });
+  await f.submit(); assert.deepEqual(calls[0][1], { task: { id: 'a', delivery: { summary: '本地草稿' } }, base: { delivery: { summary: '旧结论' } } });
 });
 
 test('中文组合输入、229兼容键码与长按回车不会误提交', async () => {
@@ -165,7 +166,7 @@ test('显式提交验收写ISO时间，可单独清除时间', async () => {
   assert.equal(new Date(delivery.submittedAt).toISOString(), delivery.submittedAt);
   assert.ok(Date.parse(delivery.submittedAt) >= before && Date.parse(delivery.submittedAt) <= Date.now());
   button(f.render(), '清除提交时间').props.onClick(); await f.submit();
-  assert.deepEqual(calls[1][1], { task: { id: 't1', delivery: { submittedAt: '' } } });
+  assert.deepEqual(calls[1][1], { task: { id: 't1', delivery: { submittedAt: '' } }, base: { delivery: { submittedAt: delivery.submittedAt } } });
 });
 
 test('提交验收空响应保留状态、时间和草稿，普通保存重试不改提交时间', async () => {
@@ -200,7 +201,7 @@ test('主成果仅选登记产物，当前采用复用原预览回调且可以�
   find(f.tree, row => row.props.className === 'pb-primary-artifact').props.onClick();
   assert.equal(opened[0], artifact);
   f.change('主成果', 'outside.txt'); await f.submit(); assert.equal(calls.length, 0); assert.match(text(f.render()), /主成果已不在登记产物中/);
-  f.change('主成果', ''); await f.submit(); assert.deepEqual(calls[0][1], { task: { id: 't1', primaryArtifactPath: '' } });
+  f.change('主成果', ''); await f.submit(); assert.deepEqual(calls[0][1], { task: { id: 't1', primaryArtifactPath: '' }, base: { primaryArtifactPath: artifact.path } });
 });
 
 test('长摘要默认第一行短结论，完整原文可展开且逐字保留', () => {
@@ -256,4 +257,92 @@ test('节点产物标记当前采用、原预览不变，决策行可被导航�
   assert.equal(opened[0].path, artifact.path);
   f.render({ ...props, tab: 'history' });
   assert.equal(text(find(f.tree, row => row.props['data-decision-id'] === 'decision-1')), '下一步？待决策');
+});
+
+// 调用真实服务端三方校验；组件测试同时验证发送的草稿起点与服务端接受/拒绝结果。
+const validateBase = (board, action, input) => BoardService.prototype.checkFieldBase.call(null, board, action, input);
+
+test('交付编辑期间SSE多次更新同字段，base保持编辑起点，真实三方校验拒绝覆盖并保留草稿', async () => {
+  let current = { id: 'a', acceptance: '原标准', delivery: { summary: '原结论', review: 'none' } };
+  const calls = [], runCommand = async (action, input) => { calls.push(plain(input)); validateBase({ tasks: [current] }, action, input); return { board: { tasks: [current] } }; };
+  const f = deliveryFixture(current, runCommand); f.change('交付结论', '本地长草稿');
+  for (const summary of ['盘上新结论一', '盘上新结论二']) {
+    current = { ...current, acceptance: '远端更新了其他字段', delivery: { ...current.delivery, summary } };
+    f.render({ item: current, targetType: 'task', runCommand }); await f.submit();
+    assert.equal(calls.at(-1).base.delivery.summary, '原结论');
+    assert.equal(field(f.render(), '交付结论').props.value, '本地长草稿');
+    assert.match(text(find(f.tree, row => row.props.role === 'alert')), /版本冲突.*草稿已保留/);
+    assert.equal(current.delivery.summary, summary);
+  }
+});
+
+test('SSE只更新其他字段时编辑可合并，未编辑字段采用新base且不会一并写回', async () => {
+  let current = { id: 'a', acceptance: '原标准', delivery: { summary: '原结论', review: 'none' } };
+  const calls = [], runCommand = async (action, input) => {
+    calls.push(plain(input)); validateBase({ tasks: [current] }, action, input);
+    const patch = input.task; current = { ...current, ...patch, delivery: { ...current.delivery, ...patch.delivery } };
+    return { board: { tasks: [current] } };
+  };
+  const f = deliveryFixture(current, runCommand); f.change('交付结论', '本地新结论');
+  current = { ...current, acceptance: '远端新标准', delivery: { ...current.delivery, review: 'pending' } };
+  f.render({ item: current, targetType: 'task', runCommand }); await f.submit();
+  assert.deepEqual(calls[0], { task: { id: 'a', delivery: { summary: '本地新结论' } }, base: { delivery: { summary: '原结论' } } });
+  assert.equal(current.acceptance, '远端新标准'); assert.equal(current.delivery.review, 'pending'); assert.equal(current.delivery.summary, '本地新结论');
+  assert.equal(nodes(f.render()).some(row => row.props.role === 'alert'), false);
+  f.change('验收标准', '新的显式标准'); await f.submit();
+  assert.deepEqual(calls[1], { task: { id: 'a', acceptance: '新的显式标准' }, base: { acceptance: '远端新标准' } });
+});
+
+test('保存期间继续编辑同字段，下一次base使用本次实际提交结果，不越过更晚SSE修改', async () => {
+  let resolve; const calls = [];
+  const runCommand = async (action, input) => {
+    calls.push(plain(input));
+    if (calls.length === 1) return new Promise(done => { resolve = done; });
+    validateBase({ tasks: [{ id: 'a', delivery: { summary: '更晚远端更新' } }] }, action, input);
+    return { board: {} };
+  };
+  const f = deliveryFixture({ id: 'a', delivery: { summary: '旧结论' } }, runCommand);
+  f.change('交付结论', '第一版'); const saving = f.submit(); f.change('交付结论', '继续输入的第二版');
+  f.render({ item: { id: 'a', delivery: { summary: '更晚远端更新' } }, targetType: 'task', runCommand });
+  resolve({ board: { tasks: [{ id: 'a', delivery: { summary: '更晚远端更新' } }] }, committedBoard: { tasks: [{ id: 'a', delivery: { summary: '第一版' } }] } }); await saving; f.render(); await f.submit();
+  assert.deepEqual(calls[1].base, { delivery: { summary: '第一版' } });
+  assert.equal(field(f.render(), '交付结论').props.value, '继续输入的第二版');
+  assert.match(text(f.tree), /版本冲突/);
+});
+
+test('保存期间新编辑的其他字段保留自己的起点，保存成功不会把它悄悄重设为远端值', async () => {
+  let resolve; const calls = [];
+  const runCommand = async (action, input) => {
+    calls.push(plain(input));
+    if (calls.length === 1) return new Promise(done => { resolve = done; });
+    validateBase({ tasks: [{ id: 'a', acceptance: '远端标准', delivery: { summary: '已提交结论' } }] }, action, input);
+    return { board: {} };
+  };
+  const f = deliveryFixture({ id: 'a', acceptance: '原标准', delivery: { summary: '旧结论' } }, runCommand);
+  f.change('交付结论', '已提交结论'); const saving = f.submit(); f.change('验收标准', '本地后续标准');
+  const current = { id: 'a', acceptance: '远端标准', delivery: { summary: '已提交结论' } };
+  f.render({ item: current, targetType: 'task', runCommand }); resolve({ board: { tasks: [current] } }); await saving; f.render(); await f.submit();
+  assert.deepEqual(calls[1], { task: { id: 'a', acceptance: '本地后续标准' }, base: { acceptance: '原标准' } });
+  assert.equal(field(f.render(), '验收标准').props.value, '本地后续标准'); assert.match(text(f.tree), /版本冲突/);
+});
+
+test('节点概览草稿在SSE同字段变化后携带原base，其他字段更新可正常合并', async () => {
+  for (const sameField of [false, true]) {
+    let node = { id: 'n', title: '原节点名', summary: '原概览', kind: 'figure' };
+    let board = { nodes: [node], edges: [], notes: [], changes: [], tasks: [], todos: [], decisions: [] };
+    const calls = [], runCommand = async (action, input) => {
+      calls.push(plain(input)); validateBase(board, action, input);
+      node = { ...node, ...input.node }; board = { ...board, nodes: [node] }; return { board };
+    };
+    const props = () => ({ board, node, runCommand, executionFor() {}, threadUi: { selectedFor() {} } });
+    const f = fixture('PbNodeInspector', props());
+    find(f.tree, row => row.props['aria-label'] === '概览').props.onChange({ target: { value: '本地概览草稿' } }); f.render();
+    node = { ...node, title: '远端新节点名', ...(sameField ? { summary: '远端新概览' } : {}) }; board = { ...board, nodes: [node] };
+    f.render(props()); await find(f.tree, row => row.type === 'form' && row.props.className === 'pb-sec pb-overview-editor').props.onSubmit(event()); f.render();
+    assert.deepEqual(calls[0], { node: { id: 'n', summary: '本地概览草稿' }, base: { summary: '原概览' } });
+    assert.equal(node.title, '远端新节点名');
+    assert.equal(find(f.tree, row => row.props['aria-label'] === '概览').props.value, '本地概览草稿');
+    if (sameField) { assert.equal(node.summary, '远端新概览'); assert.match(text(f.tree), /版本冲突.*草稿已保留/); }
+    else { assert.equal(node.summary, '本地概览草稿'); assert.equal(nodes(f.tree).some(row => row.props.role === 'alert'), false); }
+  }
 });

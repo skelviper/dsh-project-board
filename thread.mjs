@@ -33,11 +33,12 @@ export function transcriptFromSnapshot(snapshot, { limit = 200, startSeq = 0 } =
     const base = { seq: event.seq, time: event.time, type: event.type };
     if (event.type === 'user/message') {
       const sourceKind = data.source && typeof data.source === 'object' ? data.source.kind : undefined;
-      // Only real conversation turns: skip agent-instructions, runtime-context,
-      // skill-catalog, time-context and other synthetic context messages.
-      if (sourceKind !== 'user' && sourceKind !== 'goal') continue;
+      // 维护通知保留机器来源，不能在紧凑记录中冒充真实用户提问。
+      if (sourceKind !== 'user' && sourceKind !== 'goal' && sourceKind !== 'project-board-maintenance') continue;
       const text = textOf(data.content);
-      if (text) rows.push({ ...base, kind: 'user', text: clip(text, MAX_TEXT) });
+      if (text) rows.push(sourceKind === 'project-board-maintenance'
+        ? { ...base, kind: 'note', sourceKind, text: clip(text, MAX_TEXT) }
+        : { ...base, kind: 'user', text: clip(text, MAX_TEXT) });
     } else if (event.type === 'assistant/message') {
       const message = data.message && typeof data.message === 'object' ? data.message : {};
       const text = textOf(message.content);

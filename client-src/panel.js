@@ -14,6 +14,11 @@ function PbModal({ title, children, onClose, actions }) {
       h('div', { className: 'pb-modal-actions' }, ...(actions || []))));
 }
 
+// 维护控件的输入和重试由独立 fragment 管理，主面板负责项目作用域与写入队列。
+function PbMaintenancePanel(props) {
+  return h(PbMaintenancePanelBody, props);
+}
+
 function ProjectBoardPanel(props) {
   const { workspacesSource, sessionsSource, sessionStatusSource, layout, uiWorkspace, sessions, createSession } = props;
   const workspacesSnap = useObservableSource(workspacesSource);
@@ -309,13 +314,23 @@ function ProjectBoardPanel(props) {
       return null;
     }
     ++scope.pendingCommands;
-    setBusy(true); setError('');
+    setBusy(true); if (options.reportError !== false) setError('');
     // 同项目本地写入依次出队；revision 在真正发送时读取，避免快速拖动互相冲突。
     const operation = scope.commands.then(async () => {
       assertCurrentWorkspace();
       if (!boardRef.current && action !== 'create_board') throw new Error('该 workspace 还没有看板');
       if (action === '__dispatch_task' || action === '__dispatch_todo') {
         return dispatchItems(action === '__dispatch_task' ? [{ taskId: input.taskId }] : [{ todoId: input.todoId }]);
+      }
+      if (action === '__maintenance') {
+        const response = await pbFetchJson('/api/project-board/maintenance', {
+          method: 'POST',
+          body: JSON.stringify({ workspacePath, operation: input.operation, commandId: input.commandId || pbUuid(), roots: input.roots, message: input.message, conflictId: input.conflictId, choice: input.choice }),
+        });
+        assertCurrentWorkspace();
+        if (!response?.board) throw new Error('维护未返回看板，请重试');
+        applyBoard(response.board);
+        return { ...response, board: boardRef.current };
       }
       async function execute(commandAction, commandInput) {
         assertCurrentWorkspace();
@@ -335,7 +350,7 @@ function ProjectBoardPanel(props) {
         if (commandAction === 'delete_todo' || commandAction === 'delete_task') setConversation((current) => current?.targetId === commandInput?.id ? null : current);
         if (commandAction === 'delete_node') setSelectedNodeId((current) => current === commandInput?.id ? null : current);
         if (commandAction === 'create_board') loadWorkspaceInfo();
-        return { ...response, board: boardRef.current };
+        return { ...response, committedBoard: response.board, board: boardRef.current };
       }
       if (action === '__connect_nodes') {
         // 按出队后的最新看板规划；多个归属修复命令也作为同一队列项完成。
@@ -349,7 +364,7 @@ function ProjectBoardPanel(props) {
     }).catch(async (err) => {
       // 冲突后的刷新也属于当前队列项，后续本地写入须等待最新 revision。
       if (isCurrentWorkspace()) {
-        setError(err.message + (err.code === 'STALE_REVISION' ? '（已请求重载，请检查后重试）' : ''));
+        if (options.reportError !== false) setError(err.message + (err.code === 'STALE_REVISION' ? '（已请求重载，请检查后重试）' : ''));
         if (err.code === 'STALE_REVISION' || err.code === 'BOARD_NOT_FOUND') await loadBoard(workspacePath, { keepSelection: true, keepError: true });
       }
       throw err;
@@ -365,6 +380,10 @@ function ProjectBoardPanel(props) {
       --scope.pendingCommands;
       if (isCurrentWorkspace()) setBusy(scope.pendingCommands > 0);
     }
+  }
+
+  function runMaintenance(operation, input = {}) {
+    return runCommand('__maintenance', { ...input, operation }, { throwOnError: true, reportError: false });
   }
 
   async function deleteEdge(id) {
@@ -539,6 +558,10 @@ function ProjectBoardPanel(props) {
     h('span', { className: 'pb-spacer' }),
     board ? h(React.Fragment, null,
       h('button', { className: 'pb-btn', onClick: () => loadBoard(workspacePath, { keepSelection: true }) }, h(PbIcon, { name: 'refresh', size: 13 }), '刷新'),
+      h(PbMaintenancePanel, {
+        key: workspacePath, board, workspacePath, workspaceScope: scope, isCurrentWorkspace, runMaintenance,
+        onContinue: guardWorkspace(() => { setConversation(null); setRightTab('assistant'); if (renderedDockWidth < 260) setDockWidth(clampDock(400)); }),
+      }),
       h('button', { className: 'pb-btn', onClick: guardWorkspace(() => setNodeModal({ position: null })) }, h(PbIcon, { name: 'plus', size: 13 }), '节点'),
       h('button', {
         className: 'pb-btn' + (connectMode ? ' on' : ''), disabled: connectPending, 'aria-pressed': connectMode,
@@ -612,7 +635,7 @@ function ProjectBoardPanel(props) {
           onClose: guardWorkspace(() => { setConversation(null); setRightTab('inspector'); setInspectorTab('overview'); }), onOpenSession: guardWorkspace((id) => props.openSession(id, isCurrentWorkspace)),
           onSelectThread: selectThread, onCreateThread: createThread, onRemoveThread: removeThread,
           onOpenArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })),
-          acquireConversationSession: props.acquireConversationSession, initializeDraft: props.initializeDraft,
+          acquireConversationSession: props.acquireConversationSession,
           SessionProvider: props.SessionProvider, renderSlot: props.renderSlot, workspaceFiles: props.workspaceFiles,
         }) : rightTab === 'inbox' ? h(PbInbox, { rows: inboxRows, seen: workspaceSeen, onSeen: markViewed, onOpen: focusRow }) : rightTab === 'history' ? h(PbBoardChangeHistory, { board, onUndo: undoChange, runCommand }) : rightTab === 'assistant' ? h(BoardAssistant, {
           key: workspacePath,
@@ -623,7 +646,7 @@ function ProjectBoardPanel(props) {
           sessionsSnapshot: sessionsSnap,
           runCommand,
           createSession: props.createSession,
-          acquireConversationSession: props.acquireConversationSession, initializeDraft: props.initializeDraft,
+          acquireConversationSession: props.acquireConversationSession,
           SessionProvider: props.SessionProvider, renderSlot: props.renderSlot, workspaceFiles: props.workspaceFiles,
           onOpenSession: guardWorkspace((id) => props.openSession(id, isCurrentWorkspace)),
         }) : (selectedNode ? h(PbNodeInspector, {

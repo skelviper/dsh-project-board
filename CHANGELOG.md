@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1
+
+- Add on-demand disk discovery, persistent source baselines, and field-level three-way merges through the Board Lead and a maintenance API/tool.
+- Add update/notify controls, archive records, and explicit choices for unresolved maintenance conflicts.
+- Record durable deletion markers and archive explicitly owned outputs with SHA manifests, shared-reference and running-job checks; late upserts cannot recreate deleted work.
+- Preserve draft field bases across remote updates, so an old editor cannot silently replace a concurrent edit.
+- Keep scans bounded and exclude historical archives, public-input payloads, source repositories, and training output trees; file presence never establishes completion or acceptance.
+- Supply linked task context separately from user drafts, send only changed context on later steps, and restore the full baseline after compaction when needed.
+- Preserve user text and attachments when removing a complete legacy task-background draft template.
+- Constrain model-triggered file archiving to the calling workspace and its standing writable sandbox boundary; keep maintenance notices distinct from real user prompts in compact transcripts.
+- Preserve task associations on board read failures and honor downstream rejection of offered continuation input.
+
 ## 0.2.0
 
 - Add task and todo delivery summaries, outcomes, review states, and primary artifacts.

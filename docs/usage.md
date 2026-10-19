@@ -1,6 +1,6 @@
 # Usage guide
 
-`dsh-project-board` 0.2.0 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
+`dsh-project-board` 0.2.1 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
 
 ## Create a board for a workspace
 
@@ -34,7 +34,7 @@ In the Board Lead conversation, requests can be written in English, for example:
 
 > Create a Release 1.0 milestone, API and Web client components, and a Release guide document. Add a task to review the API contract, with drafting and review todos. Read the current board before making changes.
 
-The Board Lead can change the board through the plugin tools. Opening a conversation or preparing a task-context draft does not send a request; review the draft and submit it through DSH when ready.
+The Board Lead can change the board through the plugin tools. Opening a conversation restores its history and your draft without sending a request. Enter your next instruction and submit it through DSH when ready.
 
 ## Work with the canvas and inspector
 
@@ -53,7 +53,9 @@ Each task and todo can link up to 20 DSH sessions. Click **会话** (Conversatio
 
 A todo with no session of its own can use its parent task's sessions, shown as **所属任务会话** (Parent task conversation). This is a fallback for viewing and navigation, not an extra stored binding. A todo's own links take priority; removing its last own link restores the fallback. Remove inherited links from the parent task, not from the todo.
 
-Task context can initialize an empty draft with the node, acceptance criteria, dependencies, write scopes, artifacts, and relevant notes. An existing draft is retained. For inherited task sessions, the todo does not replace the shared draft with todo context.
+**任务背景 · 已自动关联** (Task background · Automatically linked) is a collapsed preview of the background associated with the selected session. Your composer contains only your own draft. The host supplies necessary requirements as a separate context message when you send: the first message includes the background, later messages include only relevant changes, and unchanged background is retained. If compaction removes the complete baseline, the host supplies it again. An inherited task session receives its actual task association rather than an extra todo binding. Opening the page itself does not start work.
+
+Complete legacy task-background templates are removed from the start of a draft using a revision-checked range edit. Text you added after the template, reference chips, and attachments are retained. Drafts that do not match the known template remain unchanged.
 
 **打开完整会话** (Open full conversation) navigates to the same session ID after it finishes loading. Loading failures are shown with a retry action. Removing a session link, task, or todo does not delete the actual DSH conversation. Deleting a task also removes its todos and their board references.
 
@@ -77,7 +79,7 @@ Select `primaryArtifactPath` from the item's registered artifact paths, or clear
 
 Statistics include a node itself and every descendant reached through `contains` edges, with each task and todo counted once. A task with todos contributes its todos; a task without todos contributes itself. **完成** (Done) counts only `done`; **已结束** (Closed) includes `done`, `dropped`, and `historical`. Closure percentage describes workflow progress and does not imply that a hypothesis was supported.
 
-The **变更** (Changes) view and item history show actor, time, affected entries, and eligible undo actions. Call `project_board_update` with `action: "undo_change"` and `input: {"changeId": "…"}` to undo one change. Undo restores only the original fields and first checks their current values, entry identity, and relationships; any conflict rejects the entire undo. Cascaded data from a node or task deletion can be restored together. Session associations, team dispatch, and other external actions cannot be undone.
+The **变更** (Changes) view and item history show actor, time, affected entries, and eligible undo actions. Call `project_board_update` with `action: "undo_change"` and `input: {"changeId": "…"}` to undo one change. Undo restores only the original fields and first checks their current values, entry identity, and relationships; any conflict rejects the entire undo. Cascaded data from an empty board-only node or task deletion can be restored together. Deletions with files, session associations, team dispatch, and other external actions cannot use this JSON-only undo.
 
 History is stored in `changes[]` within the same board, bounded to 80 records and 2 MiB. Large changes retain a summary without undo data. History is recorded for new operations; old operations cannot be reconstructed retroactively. History can retain deleted content and its actor until it ages out, so deleting an item does not immediately erase its history. These records are project data and must not be included when sharing the plugin source.
 
@@ -92,7 +94,25 @@ Register file or directory paths on nodes, tasks, or todos. In **产物** (Artif
 
 File links, image cards, and `@file` references inside embedded conversations use the same preview. It uses an existing session as the context for DSH's read-only `remote.workspaceFiles` service; previewing a file does not create or activate an agent. The service controls access, read limits, and errors. Manual downloads and artifact thumbnails use the plugin's artifact endpoint, which limits files to 25 MiB.
 
-The board stores references to artifacts, not copies of their contents. There is no automatic filesystem scan. The **刷新** (Refresh) button reloads board data; ask an agent to inspect project files and write board changes when you want project progress reconciled.
+The board stores references to artifacts, not copies of their contents. **刷新** (Refresh) only reloads board data. **更新看板** (Update board) checks the selected active scope and sends an organization request to the existing Board Lead session. The Lead prioritizes updating existing tasks and sources against the current project goals and adds a node only for a clearly independent work item. Newly discovered directories and documents become candidate clues in `maintenance.candidates`; discovery does not create a card for each path. Independent changes to an already linked source can still merge automatically. Unchanged source fields preserve manual edits; conflicting edits keep the board value and create an explicit decision.
+
+## Maintain disk content and archive deleted work
+
+Open **维护记录** (Maintenance records) to see the last check, the number of **待整理** (Awaiting organization) clues, unresolved conflicts, and deletion/archive records. The clue count includes only candidates with `status: "pending"`; candidates already linked to work are excluded. The panel keeps this information compact instead of listing every discovered directory or document. Follow the existing Lead conversation for organization progress. Choose **保留看板 / 采用盘上** to resolve a field conflict. The service checks the current board value and source fingerprint before applying the choice; if either changed, check again and decide from the new context.
+
+Both **更新看板** (Update board) and the separate **通知看板 Lead** (Notify Board Lead) form use `operation: "notify"`: check disk content, then queue a request in the existing Lead session. The main button supplies the project-oriented organization instruction; the separate form retains an optional message for the user. The same conversation, model settings, and history remain available. **已通知** (Notified) means that the request was queued, not that organization has finished. Notifications do not interrupt the Lead's current turn. Agents working in the same workspace can call `project_board_maintain` with `operation: "notify"`, a stable `commandId`, and a short `message` after creating a report or completing a task. `operation: "scan"` remains available as a bounded check without waking the Lead. The Lead can inspect unresolved choices and ask the user when interpretation is needed. Board changes arrive through SSE; there is no polling or continuous file watcher.
+
+The collapsed scope configuration is empty by default: `scope: "linked"` with `roots: []` checks already linked active entries. Enter project-relative directories, one per line, to use a custom scope (`scope: "custom"`). Clearing the input and saving sends `roots: []` and restores the linked scope. Checks have bounded depth, entry, candidate, and document-size limits. Discovery reads Markdown metadata and project-unit names; it excludes historical archives, public-input payloads, source repositories, hidden/control directories, and deep training output trees. Limits and skipped paths are reported in the summary. Unknown content remains a candidate for the Lead to organize; its existence never marks a task completed, accepted, or scientifically supported.
+
+**删除并归档** (Delete and archive) removes the selected board item and its directly attached work. Deleting a node preserves its contained child nodes. The service first persists a durable deletion marker; late agent updates and future scans cannot recreate that item or its recorded source paths. Session histories remain available in DSH.
+
+Model calls that can process the archive queue (`delete_node`, `delete_task`, `delete_todo`, `undo_change`, and maintenance `scan`/`notify`/`resolve`) are restricted to the caller's current workspace and standing writable sandbox boundary. Read-only, missing-policy, and out-of-boundary calls are rejected before board mutation or file moves. Authenticated user actions in the Web UI remain separate from these model-tool checks.
+
+Only explicitly owned paths can archive automatically. A top-level theme's directory-navigation link does not claim every descendant as a shared input; actual source/artifact/scope/ownership references remain protected. Candidate discovery and pre-existing links alone do not establish ownership; exclusive paths must be recorded explicitly in `ownedPaths`. Unclear ownership, protected/shared paths, ongoing sessions/jobs, limits, or filesystem errors preserve the files and create a choice. **保留文件** retains disk content while keeping the deletion marker; **重试归档** confirms the listed scope and rechecks occupancy and sharing. It cannot override those protections.
+
+Archives are written beneath `archive/board/<operation-id>/` with a per-file size/SHA manifest and direct completion receipt. Normal maintenance never enumerates an existing archive. Same-filesystem renames retain the original bytes; interrupted operations retain moved and unmoved content and report the exact manifest for review. They are not silently resumed or overwritten. A deletion with files cannot use JSON-only undo. Empty board-only deletions remain eligible for checked undo; there is no automatic restoration of archived files.
+
+Maintenance scope, candidate clues, linked sources, field baselines, choices, and durable deletion markers are stored inside the original board, rather than in a parallel project-status file. Each candidate records `path`, `kind`, `title`, `summary`, `fingerprint`, and a `pending`, `linked`, or `dismissed` status; a linked candidate may also record `targetType` and `targetId`. The Lead can use `operation: "dismiss"` with `paths` and a brief `message` to ignore unrelated clues without recreating them on a later check.
 
 ## Agent tools
 
@@ -103,6 +123,7 @@ Agents receive a compact board summary in their runtime context when their works
 | `project_board_get` | Read `digest`, `board`, `node`, `tasks`, `todos`, or a compact session `thread` |
 | `project_board_update` | Create or rename a board; edit nodes, edges, tasks, todos, notes, decisions, positions, and session bindings |
 | `project_board_dispatch` | Create Agent Team tasks from board tasks or todos, using a Lead session |
+| `project_board_maintain` | `state`, bounded `scan`, `notify` the persistent Lead, `resolve` a conflict, or `configure` roots; current workspace only |
 
 `workspacePath` selects a registered workspace by absolute path. When omitted, the tools resolve the workspace from the current session's working directory. For another workspace, request `view: "board"` explicitly to inspect its full state.
 
@@ -138,11 +159,11 @@ For session bindings, use `action: "bind_thread"` with `input` containing exactl
 
 ## Stored data model
 
-The schema version remains `1`; the package version is `0.2.0`. The main structures are:
+The schema version remains `1`; the package version is `0.2.1`. The main structures are:
 
 ```text
 board:  { version, revision, workspacePath, title, nodes[], edges[], tasks[],
-          todos[], decisions[], notes[], changes[], assistant?, applied[], timestamps… }
+          todos[], decisions[], notes[], changes[], assistant?, maintenance?, applied[], timestamps… }
 node:   { id, kind, title, summary, status, x, y, w, links[], derivedFrom[], tags[] }
 edge:   { id, from, to, kind: contains|depends|produces, label }
 task:   { id, nodeId, title, status, owner, acceptance, blockedBy[],
@@ -170,6 +191,7 @@ The following routes are registered through DSH's authenticated `connection.fetc
 | GET | `/api/project-board/state?workspacePath=…` | Board state |
 | POST | `/api/project-board/command` | Mutation with optional `expectedRevision` and `commandId` |
 | POST | `/api/project-board/dispatch` | Agent Team dispatch |
+| POST | `/api/project-board/maintenance` | On-demand scan/notify/configure/resolve/state with `workspacePath` and `operation` |
 | GET | `/api/project-board/thread?sessionId=…&limit=…` | Compact session transcript |
 | GET | `/api/project-board/artifact?workspacePath=…&path=…` | Workspace artifact download or preview, up to 25 MiB |
 | GET | `/api/project-board/events?workspacePath=…` | Server-sent board change notifications |

@@ -190,7 +190,6 @@ const pbClientEntry = {
       uiWorkspace: ctx.uiWorkspace,
       sessions: ctx.sessions,
       createSession: (workspaceId, sessionId) => ctx.sessions.create({ workspaceId, sessionId }),
-      initializeDraft: (binding, prompt) => ctx.conversation.input.requestDraftInitialization(binding, { prompt, clearPreviousDraft: false }),
       openSession: (sessionId, isCurrent) => pbOpenSession(ctx, sessionId, isCurrent),
       modelDirectories: ctx.modelDirectories,
       acquireConversationSession: async (sessionId) => {

@@ -2,8 +2,22 @@
 const PB_DELIVERY_OUTCOMES = { unspecified: '未填写', supported: '支持假设', not_supported: '未支持假设', not_triggered: '条件未触发', inconclusive: '尚无定论' };
 const PB_DELIVERY_REVIEWS = { none: '未提交', pending: '待验收', accepted: '已验收', changes_requested: '需修改' };
 
+function pbConfirmArchiveDelete(targetType, title) {
+  const label = { node: '节点', task: '任务', todo: '待办' }[targetType];
+  const scope = targetType === 'node' ? '及其直挂任务和待办？子节点会保留，不会递归删除整个分支。' : targetType === 'task' ? '及其待办？' : '？';
+  return window.confirm('删除并归档' + label + '「' + title + '」' + scope + '\n仅独占文件可自动归档；共享或活动文件的冲突进入维护记录待决策。既有会话会保留。');
+}
+
 function pbDeliveryValues(item) {
   return { acceptance: item.acceptance || '', summary: item.delivery?.summary || '', outcome: item.delivery?.outcome || 'unspecified', review: item.delivery?.review || 'none', submittedAt: item.delivery?.submittedAt || '', primaryArtifactPath: item.primaryArtifactPath || '' };
+}
+
+// base 与 patch 同形，且仅包含实际提交的字段；草稿起点不随 SSE 的同字段更新漂移。
+function pbDeliveryBase(patch, values) {
+  const base = {};
+  for (const key of ['acceptance', 'primaryArtifactPath']) if (Object.hasOwn(patch, key)) base[key] = values[key];
+  if (patch.delivery) base.delivery = Object.fromEntries(Object.keys(patch.delivery).map((key) => [key, values[key]]));
+  return base;
 }
 
 // 只写显式改动的字段；旧验收文本不会复制到交付结论，服务端合并 delivery 子字段。
@@ -42,33 +56,57 @@ function PbDeliveryEditorForm({ item, targetType, runCommand, onOpenArtifact }) 
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState('');
   const saved = React.useRef(pbDeliveryValues(item));
+  const draftRef = React.useRef(pbDeliveryValues(item));
+  const draftBase = React.useRef(pbDeliveryValues(item));
   const pending = React.useRef(false), composing = React.useRef(false);
   React.useEffect(() => {
-    const previous = saved.current, next = pbDeliveryValues(item);
-    saved.current = next;
-    setDraft((current) => Object.fromEntries(Object.keys(next).map((key) => [key, current[key] === previous[key] ? next[key] : current[key]])));
+    const previous = saved.current, next = pbDeliveryValues(item), current = draftRef.current;
+    const merged = {};
+    for (const key of Object.keys(next)) {
+      const unedited = current[key] === previous[key];
+      merged[key] = unedited ? next[key] : current[key];
+      if (unedited) draftBase.current[key] = next[key];
+    }
+    saved.current = next; draftRef.current = merged; setDraft(merged);
   }, [item.acceptance, item.primaryArtifactPath, item.delivery?.summary, item.delivery?.outcome, item.delivery?.review, item.delivery?.submittedAt]);
   const artifacts = (item.artifacts || []).filter((row, index, all) => row.path && all.findIndex((other) => other.path === row.path) === index);
   const primary = artifacts.find((row) => row.path === item.primaryArtifactPath);
   const dirty = Object.keys(pbDeliveryPatch(saved.current, draft)).length > 0;
-  const change = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
+  function change(key, value) {
+    if (draftRef.current[key] === saved.current[key]) draftBase.current[key] = saved.current[key];
+    draftRef.current = { ...draftRef.current, [key]: value }; setDraft(draftRef.current);
+  }
 
   async function save(event, submitForReview = false) {
     event.preventDefault();
     if (pending.current || composing.current || event.nativeEvent?.isComposing) return;
-    const submitted = submitForReview ? { ...draft, review: 'pending', submittedAt: new Date().toISOString() } : { ...draft };
+    const submitted = submitForReview ? { ...draftRef.current, review: 'pending', submittedAt: new Date().toISOString() } : { ...draftRef.current };
     const patch = pbDeliveryPatch(saved.current, submitted);
     if (!Object.keys(patch).length) return;
     if (patch.primaryArtifactPath && !artifacts.some((row) => row.path === patch.primaryArtifactPath)) { setError('主成果已不在登记产物中，请重新选择或清除。'); return; }
-    if (submitForReview) setDraft(submitted);
+    if (submitForReview) {
+      for (const key of ['review', 'submittedAt']) if (draftRef.current[key] === saved.current[key]) draftBase.current[key] = saved.current[key];
+      draftRef.current = submitted; setDraft(submitted);
+    }
+    const base = pbDeliveryBase(patch, draftBase.current);
     pending.current = true; setSaving(true); setError('');
     try {
-      const response = await runCommand(targetType === 'task' ? 'upsert_task' : 'upsert_todo', { [targetType]: { id: item.id, ...patch } }, { throwOnError: true });
+      const response = await runCommand(targetType === 'task' ? 'upsert_task' : 'upsert_todo', { [targetType]: { id: item.id, ...patch }, base }, { throwOnError: true });
       if (!response) throw new Error('保存未成功，草稿已保留，请重试。');
-      const stored = response.board?.[targetType === 'task' ? 'tasks' : 'todos']?.find((row) => row.id === item.id);
+      const collection = targetType === 'task' ? 'tasks' : 'todos';
+      const stored = response.board?.[collection]?.find((row) => row.id === item.id);
+      const committed = response.committedBoard?.[collection]?.find((row) => row.id === item.id);
       const next = stored ? pbDeliveryValues(stored) : submitted;
-      saved.current = next;
-      setDraft((current) => Object.fromEntries(Object.keys(next).map((key) => [key, current[key] === submitted[key] ? next[key] : current[key]])));
+      const accepted = committed ? pbDeliveryValues(committed) : next;
+      const current = draftRef.current, merged = {};
+      for (const key of Object.keys(next)) {
+        if (current[key] === submitted[key]) { merged[key] = next[key]; draftBase.current[key] = next[key]; }
+        else {
+          merged[key] = current[key];
+          if (Object.hasOwn(patch, key) || Object.hasOwn(patch.delivery || {}, key)) draftBase.current[key] = accepted[key];
+        }
+      }
+      saved.current = next; draftRef.current = merged; setDraft(merged);
     } catch (err) { setError(pbEditorError(err, '保存失败，草稿已保留，请重试。')); }
     finally { pending.current = false; setSaving(false); }
   }
@@ -243,7 +281,7 @@ function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, o
           try { await runCommand('__dispatch_task', { taskId: task.id }); } catch { /* panel shows the error */ } finally { setDispatching(false); }
         },
       }, canDispatch ? (dispatching ? '派发中…' : '派发') : '已派发'),
-      h('button', { className: 'pb-icon-btn', title: '删除任务', onClick: () => runCommand('delete_task', { id: task.id }) }, h(PbIcon, { name: 'trash', size: 13 }))),
+      h('button', { className: 'pb-btn small danger', title: '删除并归档', 'aria-label': '删除并归档任务：' + task.title, onClick: () => { if (pbConfirmArchiveDelete('task', task.title)) runCommand('delete_task', { id: task.id }); } }, h(PbIcon, { name: 'trash', size: 13 }), '删除并归档')),
     expanded ? h('div', { style: { padding: '7px 9px 9px' } },
       h(PbDeliveryEditor, { item: task, targetType: 'task', runCommand, onOpenArtifact }),
       task.writeScopes?.length ? h('div', { className: 'pb-row-sub', style: { marginBottom: 6 } }, 'write scopes：' + task.writeScopes.join('、')) : null,
@@ -264,7 +302,7 @@ function PbTaskRow({ board, task, workspacePath, sessionsSnapshot, runCommand, o
             todo.team ? h(PbTeamBadge, { sessionsSnapshot, claim: todo.team }) : null),
           h(PbDeliveryEditor, { item: todo, targetType: 'todo', runCommand, onOpenArtifact })),
         h('div', { className: 'pb-actions' },
-          h('button', { className: 'pb-icon-btn', title: '删除待办', onClick: (event) => { event.stopPropagation(); runCommand('delete_todo', { id: todo.id }); } }, h(PbIcon, { name: 'trash', size: 12 }))))),
+          h('button', { className: 'pb-btn small danger', title: '删除并归档', 'aria-label': '删除并归档待办：' + todo.title, onClick: (event) => { event.stopPropagation(); if (pbConfirmArchiveDelete('todo', todo.title)) runCommand('delete_todo', { id: todo.id }); } }, h(PbIcon, { name: 'trash', size: 12 }), '删除并归档')))),
       todos.length === 0 ? h('div', { className: 'pb-row-sub', style: { margin: '2px 0 6px' } }, '还没有待办') : null,
       h(PbQuickAdd, { placeholder: '新增待办事项…（回车添加）',
         onSubmit: (title) => runCommand('upsert_todo', { todo: { taskId: task.id, title } }) })) : null);
@@ -299,11 +337,16 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
   const meta = PB_KIND_META[node.kind] || PB_KIND_META.experiment;
   const status = pbDerivedNodeStatus(board, node.id);
   const savedSummary = React.useRef(node.summary || '');
+  const summaryDraft = React.useRef(node.summary || ''), summaryBase = React.useRef(node.summary || '');
   React.useEffect(() => {
-    const previous = savedSummary.current;
-    savedSummary.current = node.summary || '';
-    setSummary((current) => current === previous ? savedSummary.current : current);
+    const previous = savedSummary.current, next = node.summary || '';
+    if (summaryDraft.current === previous) { summaryDraft.current = next; summaryBase.current = next; setSummary(next); }
+    savedSummary.current = next;
   }, [node.summary]);
+  function changeSummary(value) {
+    if (summaryDraft.current === savedSummary.current) summaryBase.current = savedSummary.current;
+    summaryDraft.current = value; setSummary(value);
+  }
 
   const artifacts = [
     ...(node.links || []).map((row) => ({ ...row, label: row.label || row.path, source: '链接' })),
@@ -313,11 +356,17 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
 
   async function saveSummary(event) {
     event.preventDefault();
-    if (summaryPending.current || summaryComposing.current || summary === (node.summary || '')) return;
+    if (summaryPending.current || summaryComposing.current || summaryDraft.current === savedSummary.current) return;
+    const submitted = summaryDraft.current, base = summaryBase.current;
     summaryPending.current = true; setSavingSummary(true); setSummaryError('');
     try {
-      const response = await runCommand('upsert_node', { node: { id: node.id, summary } }, { throwOnError: true });
+      const response = await runCommand('upsert_node', { node: { id: node.id, summary: submitted }, base: { summary: base } }, { throwOnError: true });
       if (!response) throw new Error('概览未保存，草稿已保留，请重试。');
+      const next = response.board?.nodes?.find((row) => row.id === node.id)?.summary ?? submitted;
+      const accepted = response.committedBoard?.nodes?.find((row) => row.id === node.id)?.summary ?? next;
+      savedSummary.current = next;
+      if (summaryDraft.current === submitted) { summaryDraft.current = next; summaryBase.current = next; setSummary(next); }
+      else summaryBase.current = accepted;
     } catch (err) { setSummaryError(pbEditorError(err, '保存失败，草稿已保留，请重试。')); }
     finally { summaryPending.current = false; setSavingSummary(false); }
   }
@@ -329,10 +378,10 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
     h('input', {
       id: 'pb-node-overview', type: 'text', className: 'pb-input', 'aria-label': '概览',
       placeholder: '编辑节点概览…', value: summary, title: summary,
-      onChange: (event) => setSummary(event.target.value),
+      onChange: (event) => changeSummary(event.target.value),
       onKeyDown: (event) => { if (event.key === 'Enter' && !pbIsSubmitKey(event)) event.preventDefault(); },
     }),
-    h('button', { type: 'submit', className: 'pb-btn small', disabled: savingSummary || summary === (node.summary || '') }, savingSummary ? '保存中…' : '保存')),
+    h('button', { type: 'submit', className: 'pb-btn small', disabled: savingSummary || summary === savedSummary.current }, savingSummary ? '保存中…' : '保存')),
     summaryError ? h('div', { className: 'pb-form-error', role: 'alert' }, summaryError) : null,
     summary.length > 150 || /[\r\n]/.test(summary) ? h('div', { className: 'pb-sec pb-overview-original' }, h(PbExpandableText, { text: summary })) : null);
 
@@ -395,7 +444,7 @@ function PbNodeInspector({ board, node, workspacePath, sessionsSnapshot, runComm
         h(PbStatusSelect, { value: status, onChange: (next) => runCommand('upsert_node', { node: { id: node.id, status: next === 'active' ? 'doing' : next } }), statuses: ['todo', 'doing', 'blocked', 'done', 'deferred', 'historical'] }),
         h('span', { className: 'pb-meta' }, node.id),
         h('span', { className: 'pb-spacer' }),
-        h('button', { className: 'pb-icon-btn', title: '删除节点', onClick: () => { if (window.confirm('删除节点「' + node.title + '」及其任务和待办？')) runCommand('delete_node', { id: node.id }); } }, h(PbIcon, { name: 'trash', size: 14 })),
+        h('button', { className: 'pb-btn small danger', title: '删除并归档', 'aria-label': '删除并归档节点：' + node.title, onClick: () => { if (pbConfirmArchiveDelete('node', node.title)) runCommand('delete_node', { id: node.id }); } }, h(PbIcon, { name: 'trash', size: 14 }), '删除并归档'),
         h('button', { className: 'pb-icon-btn', title: '取消选择', onClick: onClose }, h(PbIcon, { name: 'close', size: 15 }))),
       h(PbNodeMembership, { key: node.id, board, node, parentCandidates, onReparentNode }),
       h('div', { className: 'pb-tabs', role: 'tablist' },

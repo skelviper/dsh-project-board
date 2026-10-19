@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-const parts = ['state.js', 'context.js', 'style.js', 'execution.js', 'explorer.js', 'canvas.js', 'conversations.js', 'preview.js', 'inspector.js', 'delivery-style.js', 'assistant.js', 'panel.js', 'entry.js'];
+const parts = ['state.js', 'context.js', 'style.js', 'execution.js', 'explorer.js', 'canvas.js', 'conversations.js', 'preview.js', 'inspector.js', 'delivery-style.js', 'assistant.js', 'maintenance.js', 'panel.js', 'entry.js'];
 const sharedModel = fs.readFileSync(path.join(dir, 'board-model.js'), 'utf8').replace(/^export\s+(?=function|const|let|var)/gm, '');
 const bodies = [sharedModel, ...parts.map((name) => fs.readFileSync(path.join(dir, 'client-src', name), 'utf8'))];
 const bundle = [

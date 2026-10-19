@@ -123,6 +123,7 @@ function PbConversationMenu({ item, parentTask, targetType, sessionsSnapshot, se
 
 // 只在看板内接管原生文件预览，主会话保持自身的侧边栏行为。
 const PbFilePreviewContext = React.createContext(null);
+const PbConversationWorkspaceContext = React.createContext('');
 
 // 以 DSH 的公开 Factory 渲染原生会话；历史、草稿、附件和队列都属于同一 Session。
 function PbBoardConversationView(props) {
@@ -131,20 +132,23 @@ function PbBoardConversationView(props) {
 
 function PbNativeConversationSlot(props) {
   const session = props.useSession((value) => value);
+  const workspacePath = React.useContext(PbConversationWorkspaceContext);
+  const input = props.useInput((value) => value);
+  React.useEffect(() => {
+    pbRestoreConversationDraft(input, props.inputActions, workspacePath);
+  }, [workspacePath, input.draftRev, input.phase, props.inputActions]);
   return props.renderFactorySlot('conversation.content', {
     variant: 'embedded', phase: session.openState === 'loading' ? 'settling' : 'active', hero: false,
   }, { slots: { views: PbBoardConversationView } });
 }
 
-function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, initialPrompt, acquireConversationSession, initializeDraft, SessionProvider, renderSlot }) {
+function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, acquireConversationSession, SessionProvider, renderSlot }) {
   const [loaded, setLoaded] = React.useState(null);
   const [preview, setPreview] = React.useState(null);
   const openFile = React.useCallback(async (path, options) => {
     setPreview({ sessionId, workspacePath, row: { path, kind: 'file', line: options?.line } });
   }, [sessionId, workspacePath]);
   const [retry, setRetry] = React.useState(0);
-  const promptRef = React.useRef(initialPrompt);
-  promptRef.current = initialPrompt;
   React.useEffect(() => {
     if (!sessionId) return undefined;
     let active = true;
@@ -154,17 +158,16 @@ function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, init
       try {
         reference = await acquireConversationSession(sessionId);
         if (!active) { reference.release(); return; }
-        const binding = await reference.ready;
+        await reference.ready;
         if (!active) return;
-        // 默认保留已有原生文字、引用和附件；只为空草稿补充任务背景。
-        if (promptRef.current) initializeDraft(binding, promptRef.current);
+        // 打开只恢复原会话；任务背景由宿主在真实请求时独立提供。
         setLoaded({ sessionId, reference });
       } catch (error) {
         if (active) setLoaded({ sessionId, error: error.message || String(error) });
       }
     })();
     return () => { active = false; reference?.release(); };
-  }, [sessionId, acquireConversationSession, initializeDraft, retry]);
+  }, [sessionId, acquireConversationSession, retry]);
 
   if (!sessionId) return null;
   const current = loaded?.sessionId === sessionId ? loaded : null;
@@ -172,7 +175,8 @@ function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, init
     current?.error ? h('div', { className: 'pb-conversation-error', role: 'alert' }, '读取会话失败：' + current.error,
       h('button', { type: 'button', className: 'pb-btn small', onClick: () => setRetry((value) => value + 1) }, '重试载入'))
       : current?.reference ? h(PbFilePreviewContext.Provider, { value: openFile },
-        h(SessionProvider, { session: current.reference }, renderSlot('project-board.conversation', {})))
+        h(PbConversationWorkspaceContext.Provider, { value: workspacePath },
+          h(SessionProvider, { session: current.reference }, renderSlot('project-board.conversation', {}))))
       : h('div', { className: 'pb-empty' }, '正在载入会话…'),
     preview?.sessionId === sessionId && preview.workspacePath === workspacePath ? h(PbArtifactViewer, {
       key: workspacePath + ':' + sessionId + ':' + preview.row.path + ':' + (preview.row.line || 1),
@@ -181,11 +185,11 @@ function PbEmbeddedConversation({ sessionId, workspacePath, workspaceFiles, init
 }
 
 // 当前会话由父组件持有；原生输入框直接保留草稿和附件，完整会话仅导航到同一 ID。
-function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task, node, targetType, sessionId, sessionsSnapshot, onClose, onOpenSession, onSelectThread, onCreateThread, onRemoveThread, runCommand, onOpenArtifact, acquireConversationSession, initializeDraft, SessionProvider, renderSlot }) {
+function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task, node, targetType, sessionId, sessionsSnapshot, onClose, onOpenSession, onSelectThread, onCreateThread, onRemoveThread, runCommand, onOpenArtifact, acquireConversationSession, SessionProvider, renderSlot }) {
   const [error, setError] = React.useState('');
   const [opening, setOpening] = React.useState(false);
   const label = targetType === 'task' ? '任务' : '待办';
-  const context = pbTaskConversationContext(board, item, targetType);
+  const context = sessionId ? pbSessionConversationContext(board, sessionId) : pbTaskConversationContext(board, item, targetType);
   const notes = board.notes.filter((row) => row.targetType === targetType && row.targetId === item.id);
   const parentTask = targetType === 'todo' ? task : null;
   const { inherited } = pbConversationThreads(item, parentTask);
@@ -217,12 +221,13 @@ function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task
           targetType === 'todo' && task ? h('span', { className: 'pb-chip' }, task.title) : null),
         h('div', { className: 'pb-conversation-controls' }, h(PbConversationMenu, menuProps)),
         h('details', { className: 'pb-context' },
-          h('summary', null, '已关联当前' + label + '上下文'),
+          h('summary', null, sessionId && context ? '任务背景 · 已自动关联' : '任务背景'),
+          h('div', { className: 'pb-field-hint' }, sessionId && context ? '直接输入本次要求；任务背景会自动提供给 AI，变化时更新。' : '新建会话后自动关联当前' + label + '，直接输入本次要求即可。'),
           h('pre', null, context))),
       h('button', { type: 'button', className: 'pb-icon-btn', title: '返回任务列表', 'aria-label': '返回任务列表', onClick: onClose }, h(PbIcon, { name: 'close', size: 16 }))),
     sessionId ? h(PbEmbeddedConversation, {
-      key: sessionId, sessionId, workspacePath, workspaceFiles, initialPrompt: inherited ? undefined : pbTaskConversationDraft(context),
-      acquireConversationSession, initializeDraft, SessionProvider, renderSlot,
+      key: sessionId, sessionId, workspacePath, workspaceFiles,
+      acquireConversationSession, SessionProvider, renderSlot,
     }) : h('div', { className: 'pb-conversation-start' },
       h('div', { className: 'pb-empty' }, '新建会话后会带上当前' + label + '背景，可直接输入或上传文件。'),
       h('button', { type: 'button', className: 'pb-btn primary', onClick: () => onCreateThread(targetType, item.id).catch((err) => setError(err.message)) }, '新建会话')),
@@ -232,7 +237,7 @@ function PbConversationDrawer({ board, workspacePath, workspaceFiles, item, task
       h('div', { className: 'pb-drawer-actions' },
         h('button', { type: 'button', className: 'pb-btn', disabled: !sessionId || opening, onClick: openFullSession }, opening ? '正在打开…' : '打开完整会话'),
         h('button', { type: 'button', className: 'pb-btn', onClick: () => runCommand(targetType === 'task' ? 'upsert_task' : 'upsert_todo', { [targetType]: { id: item.id, status: item.status === 'done' ? 'todo' : 'done' } }) }, item.status === 'done' ? '重新打开' : '标记完成'),
-        h('button', { type: 'button', className: 'pb-btn danger', onClick: () => { if (window.confirm(`删除这个${label}？${targetType === 'task' ? '关联待办会一并删除；' : ''}会话记录会保留。`)) void runCommand(targetType === 'task' ? 'delete_task' : 'delete_todo', { id: item.id }); } }, '删除' + label)),
+        h('button', { type: 'button', className: 'pb-btn danger', 'aria-label': '删除并归档' + label + '：' + item.title, onClick: () => { if (pbConfirmArchiveDelete(targetType, item.title)) void runCommand(targetType === 'task' ? 'delete_task' : 'delete_todo', { id: item.id }); } }, '删除并归档')),
       notes.length ? h('details', { className: 'pb-context pb-context-notes' },
         h('summary', null, '条目备注（' + notes.length + '）'),
         ...notes.map((row) => h('div', { key: row.id, className: 'pb-row' }, h('div', { className: 'pb-row-text' }, h(PbExpandableText, { text: row.text })),

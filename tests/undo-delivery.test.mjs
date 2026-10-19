@@ -147,11 +147,14 @@ test('删除连线可撤销，但端点已被删除时拒绝复活悬空连线',
   assert.equal(pick(await read(), 'edges', 'e2'), undefined);
 });
 
-test('连线删除后端点同ID重建，拒绝把旧连线附到新节点', async () => {
-  const { command, read } = fixture();
+test('删除标记拒绝同ID重建；外部同ID新代次也不能接上旧连线', async () => {
+  const { command, read, store } = fixture();
   const change = await command('delete_edge', { id: 'e2' });
   await command('delete_node', { id: 'n2' });
-  await command('upsert_node', { node: { id: 'n2', title: '同ID新节点' } });
+  await assert.rejects(command('upsert_node', { node: { id: 'n2', title: '同ID新节点' } }), { code: 'ITEM_DELETED' });
+  // 模拟非API外部写入新代次，继续验证撤销的身份guard而非绕过生产删除标记。
+  const external = await read(); external.nodes.push({ id: 'n2', title: '外部新代次', createdAt: '2026-02-01T00:00:00Z' });
+  await store.write('', external);
   await assert.rejects(command('undo_change', { changeId: change.changeId }), { code: 'UNDO_CONFLICT' });
   assert.equal(pick(await read(), 'edges', 'e2'), undefined);
 });
@@ -202,11 +205,13 @@ test('任务移动历史归属包含旧新节点，撤销保留后来独立编�
   assert.equal(pick(await read(), 'tasks', 't1').owner, 'new-owner');
 });
 
-test('同ID删除后重新创建的条目不接受早先字段撤销', async () => {
-  const { command } = fixture();
+test('同ID删除后普通回写被拒绝，外部新代次不接受早先字段撤销', async () => {
+  const { command, read, store } = fixture();
   const change = await command('upsert_task', { task: { id: 't3', title: '新标题' } });
   await command('delete_task', { id: 't3' });
-  await command('upsert_task', { task: { id: 't3', nodeId: 'n2', title: '新标题' } });
+  await assert.rejects(command('upsert_task', { task: { id: 't3', nodeId: 'n2', title: '新标题' } }), { code: 'ITEM_DELETED' });
+  const external = await read(); external.tasks.push({ id: 't3', nodeId: 'n2', title: '新标题', createdAt: '2026-02-01T00:00:00Z' });
+  await store.write('', external);
   await assert.rejects(command('undo_change', { changeId: change.changeId }), { code: 'UNDO_CONFLICT' });
 });
 
@@ -215,8 +220,9 @@ test('新建节点有后来连线时不可撤销；空节点新建可撤销', as
   const first = await command('upsert_node', { node: { id: 'new-node' } });
   await command('undo_change', { changeId: first.changeId });
   assert.equal(pick(await read(), 'nodes', 'new-node'), undefined);
-  const second = await command('upsert_node', { node: { id: 'new-node' } });
-  await command('upsert_edge', { edge: { id: 'new-edge', from: 'n1', to: 'new-node' } });
+  await assert.rejects(command('upsert_node', { node: { id: 'new-node' } }), { code: 'ITEM_DELETED' });
+  const second = await command('upsert_node', { node: { id: 'next-node' } });
+  await command('upsert_edge', { edge: { id: 'new-edge', from: 'n1', to: 'next-node' } });
   await assert.rejects(command('undo_change', { changeId: second.changeId }), { code: 'UNDO_CONFLICT' });
   assert.ok(pick(await read(), 'edges', 'new-edge'));
 });

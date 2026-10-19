@@ -1,5 +1,5 @@
 // 看板 Lead 复用同一个原生 Session 的历史和输入区，支持附件与原生模型菜单。
-function BoardAssistant({ board, workspacePath, workspaceFiles, workspaceInfo, runCommand, createSession, onOpenSession, acquireConversationSession, initializeDraft, SessionProvider, renderSlot, isCurrentWorkspace }) {
+function BoardAssistant({ board, workspacePath, workspaceFiles, workspaceInfo, runCommand, createSession, onOpenSession, acquireConversationSession, SessionProvider, renderSlot, isCurrentWorkspace }) {
   const sessionId = board.assistant?.sessionId;
   const [error, setError] = React.useState('');
   const [creating, setCreating] = React.useState(false);
@@ -61,6 +61,6 @@ function BoardAssistant({ board, workspacePath, workspaceFiles, workspaceInfo, r
       } }, '完整会话') : null),
     error ? h('div', { className: 'pb-conversation-error', role: 'alert' }, error,
       !sessionId ? h('button', { className: 'pb-btn small', disabled: creating, onClick: prepareSession }, '重试创建') : null) : null,
-    sessionId ? h(PbEmbeddedConversation, { key: workspacePath + ':' + sessionId, sessionId, workspacePath, workspaceFiles, acquireConversationSession, initializeDraft, SessionProvider, renderSlot })
+    sessionId ? h(PbEmbeddedConversation, { key: workspacePath + ':' + sessionId, sessionId, workspacePath, workspaceFiles, acquireConversationSession, SessionProvider, renderSlot })
       : h('div', { className: 'pb-empty' }, creating ? '正在为这个看板创建 Lead 会话…' : '正在准备看板 Lead 会话…'));
 }

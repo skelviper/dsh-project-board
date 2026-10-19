@@ -1,4 +1,4 @@
-// 任务背景作为可编辑、未发送的原生草稿，不以打开会话代替发送操作。
+// 任务背景独立展示并由宿主提供给模型，输入框只承载用户本次的要求。
 function pbTaskConversationContext(board, item, targetType) {
   if (!board || !item) return '';
   const task = targetType === 'todo' ? board.tasks.find((row) => row.id === item.taskId) : item;
@@ -40,6 +40,24 @@ function pbTaskConversationContext(board, item, targetType) {
   return lines.join('\n');
 }
 
-function pbTaskConversationDraft(context) {
-  return context ? context + '\n\n我的要求：\n' : undefined;
+// 仅识别旧版完整机器模板；精确删前缀，用户后缀与引用由原生范围编辑保留。
+function pbLegacyTaskDraftPrefix(text, workspacePath) {
+  if (typeof text !== 'string' || !workspacePath) return '';
+  if (!/^项目看板 · 当前(?:任务|待办)上下文\n/.test(text)) return '';
+  const head = text.split('\n', 4);
+  if (head[1] !== 'workspace: ' + workspacePath || head[2] !== '看板文件: ' + workspacePath.replace(/\/$/, '') + '/board/project-board.json' || !/^看板版本: \d+$/.test(head[3])) return '';
+  const marker = '这是打开会话时的任务背景。处理前请用 project_board_get 读取最新详情，以我接下来输入的要求为准；按实际进展回写对应任务或待办。\n\n我的要求：';
+  const end = text.indexOf(marker);
+  if (end < 0) return '';
+  const last = end + marker.length;
+  const prefix = text.slice(0, last + (text[last] === '\n' ? 1 : 0));
+  if (!/^任务: .+（task [^\n]+，状态 [^\n]+）$/m.test(prefix)) return '';
+  return prefix;
+}
+
+function pbRestoreConversationDraft(input, actions, workspacePath) {
+  if (!input || input.phase !== 'plain' || !Number.isSafeInteger(input.draftRev) || typeof actions?.insertText !== 'function') return false;
+  const prefix = pbLegacyTaskDraftPrefix(input.draft, workspacePath);
+  if (!prefix || input.occurrences?.some(row => row.offset < prefix.length)) return false;
+  return actions.insertText('', { start: 0, end: prefix.length, draftRev: input.draftRev });
 }

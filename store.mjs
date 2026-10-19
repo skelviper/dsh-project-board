@@ -58,6 +58,7 @@ export class BoardStore {
     await fsp.mkdir(dir, { recursive: true });
     const tmp = path.join(dir, TMP_PREFIX + process.pid + '-' + Math.random().toString(36).slice(2));
     const text = JSON.stringify(board, null, 2) + '\n';
+    if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new BoardError('BOARD_TOO_LARGE', '看板将超过8MB，未覆盖现有记录；请先整理交付正文或维护记录', 413);
     try {
       await fsp.writeFile(tmp, text, { mode: 0o644 });
       await fsp.rename(tmp, file);

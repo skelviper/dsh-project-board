@@ -559,7 +559,7 @@ test('Lead 重试共用 in-flight Promise，绑定真实返回 ID，成功后保
   assert.equal(native.props.sessionId, 'server-returned-id');
   assert.equal(native.props.key, '/A:server-returned-id');
   assert.equal(native.props.acquireConversationSession, props.acquireConversationSession);
-  assert.equal(native.props.initializeDraft, props.initializeDraft);
+  assert.equal(native.props.initializeDraft, undefined, '恢复会话不再准备任务背景草稿');
   assert.equal(native.props.renderSlot, props.renderSlot);
 });
 

@@ -13,6 +13,8 @@ import {
   boardDigest,
 } from './schema.mjs';
 import { BoardStore } from './store.mjs';
+import { maintenancePath, boardFileReferences, discoverBoardContent, archiveBoardContent } from './maintenance-files.mjs';
+import { maintenanceState, maintenanceScanRoots, mergeBoardContent, recordBoardDeletion, assertNotDeleted, addMaintenanceConflict, resolveMaintenanceChoice, maintenancePrompt } from './maintenance.mjs';
 
 const ACTIONS = new Set([
   'create_board', 'rename_board',
@@ -180,7 +182,7 @@ function historyGuard(before, after, patch) {
 
 function makeHistory(before, after, action, actor, patches = historyPatches(before, after)) {
   const targets = historyTargets(before, after, patches);
-  const external = patches.some(patch => ['team', 'threads'].includes(patch.path[0]) || (patch.path.length === 0 && !patch.beforeExists && (patch.after?.team || patch.after?.threads?.length)));
+  const external = patches.some(patch => ['team', 'threads'].includes(patch.path[0]) || (patch.path.length === 0 && ((!patch.beforeExists && (patch.after?.team || patch.after?.threads?.length)) || (!patch.afterExists && (patch.before?.team || patch.before?.threads?.length)))));
   const available = UNDO_ACTIONS.has(action) && patches.length > 0 && !external;
   return {
     id: newId('change'), at: isoNow(), actor, action,
@@ -254,11 +256,13 @@ function undoHistory(board, changeId, actor) {
 }
 
 export class BoardService {
-  constructor({ ctx, store = new BoardStore(), logger = console }) {
+  constructor({ ctx, store = new BoardStore(), logger = console, wakeAssistant }) {
     this.ctx = ctx;
     this.store = store;
     this.logger = logger;
     this.cache = new Map(); // workspacePath -> {mtimeMs, board}
+    this.maintenanceRuns = new Map();
+    this.wakeAssistant = wakeAssistant;
   }
 
   // ---- workspace resolution -------------------------------------------------
@@ -340,7 +344,7 @@ export class BoardService {
     if (commandId !== undefined && commandId !== null && (typeof commandId !== 'string' || !commandId || commandId.length > 120)) {
       throw new BoardError('INVALID_COMMAND_ID', 'commandId 无效');
     }
-    return this.store.mutate(workspace.path, async () => {
+    const result = await this.store.mutate(workspace.path, async () => {
       const current = await this.store.read(workspace.path);
       if (!current.exists) {
         if (action !== 'create_board' && !allowCreate) {
@@ -362,21 +366,192 @@ export class BoardService {
         throw new BoardError('STALE_REVISION', `看板已被更新（当前 revision ${board.revision}，提交 ${expected}），请重载后再试`, 409, { revision: board.revision });
       }
       const before = plain(board);
+      assertNotDeleted(board, action, body);
+      this.checkFieldBase(board, action, body);
       this.applyCommand(board, action, body, actor);
+      const deletion = recordBoardDeletion(board, before, action, body);
+      if (action === 'undo_change' && board.maintenance) {
+        const restored = before.changes.find(row => row.id === body.changeId)?.targets || [];
+        const collections = { node: 'nodes', task: 'tasks', todo: 'todos' };
+        for (const d of board.maintenance.deletions) if (!d.paths.length && board[collections[d.targetType]].some(row => row.id === d.targetId) && restored.some(t => t.type === d.targetType && t.id === d.targetId)) d.status = 'restored';
+      }
       board.revision += 1;
       board.updatedAt = isoNow();
       board.updatedBy = actor;
       const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
       const change = makeHistory(before, plain(normalized), action, actor);
       if (action === 'undo_change') change.summary = `撤销：${before.changes.find(row => row.id === body.changeId)?.summary || body.changeId}`;
+      if (deletion?.paths.length) {
+        change.summary = `删除并登记归档：${deletion.title}`;
+        change.undo = { status: 'unavailable', reason: '此删除含实体归档；不能只撤销看板JSON。文件与删除决定保存在维护记录中。', undoneAt: '', undoneBy: '' };
+        change.patches = []; change.guards = [];
+      }
       normalized.changes.unshift(change);
       if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
       const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
       await this.store.write(workspace.path, committed);
       this.cache.set(workspace.path, { mtimeMs: Date.now(), board: committed });
       this.store.notify({ workspacePath: workspace.path, board: committed, actor });
-      return { board: committed, workspace, changeId: change.id, lastChange: committed.changes[0] };
+      return { board: committed, workspace, changeId: change.id, lastChange: committed.changes[0], archiveQueued: Boolean(deletion?.paths.length) };
     });
+    if ((['delete_node', 'delete_task', 'delete_todo'].includes(action) || result.archiveQueued) && !result.replayed) {
+      await this.processArchives(workspace.path);
+      result.board = (await this.store.read(workspace.path)).board;
+    }
+    return result;
+  }
+
+  // 编辑器传入草稿起点，避免SSE刷新后的旧草稿用新revision覆盖他人的同字段修改。
+  checkFieldBase(board, action, body) {
+    if (!body.base || !action.startsWith('upsert_')) return;
+    const type = action.slice(7), collections = { node: 'nodes', task: 'tasks', todo: 'todos' };
+    if (!collections[type]) return;
+    const proposal = body[type], row = board[collections[type]].find(r => r.id === proposal?.id);
+    if (!row) throw new BoardError('FIELD_CONFLICT', '编辑中的条目已删除，请保留草稿并刷新查看', 409);
+    const visit = (base, current, patch, keys = []) => {
+      for (const key of Object.keys(base)) {
+        if (['__proto__', 'constructor', 'prototype', 'id'].includes(key) || !Object.hasOwn(patch || {}, key)) continue;
+        if (key === 'delivery' && typeof base[key] === 'object' && base[key] && typeof patch[key] === 'object') { visit(base[key], current?.[key], patch[key], [...keys, key]); continue; }
+        if (isDeepStrictEqual(current?.[key], base[key]) || isDeepStrictEqual(current?.[key], patch[key])) continue;
+        if (isDeepStrictEqual(patch[key], base[key])) { delete patch[key]; continue; }
+        throw new BoardError('FIELD_CONFLICT', '这个字段已在别处更新；你的草稿已保留，请对照最新内容后决定', 409, { field: [...keys, key].join('.'), base: base[key], current: current?.[key], proposed: patch[key] });
+      }
+    };
+    visit(body.base, row, proposal);
+  }
+
+  async commitMaintenance(workspace, mutate, { commandId, operation = 'maintenance' } = {}) {
+    return this.store.mutate(workspace.path, async () => {
+      const loaded = await this.store.read(workspace.path);
+      if (!loaded.exists) throw new BoardError('BOARD_NOT_FOUND', '该 workspace 还没有看板', 404);
+      const board = loaded.board, before = plain(board);
+      const extra = await mutate(board) || {};
+      board.revision += 1; board.updatedAt = isoNow(); board.updatedBy = 'maintenance';
+      const normalized = normalizeBoard(board, { workspacePath: workspace.path, title: workspace.title });
+      const change = makeHistory(before, plain(normalized), operation, 'maintenance');
+      change.summary = extra.summary || '看板维护';
+      normalized.changes.unshift(change);
+      if (commandId) normalized.applied.unshift({ id: commandId, revision: normalized.revision, at: normalized.updatedAt, changeId: change.id });
+      const committed = normalizeBoard(normalized, { workspacePath: workspace.path, title: workspace.title });
+      await this.store.write(workspace.path, committed);
+      this.store.notify({ workspacePath: workspace.path, board: committed, actor: 'maintenance' });
+      return { ...extra, board: committed };
+    });
+  }
+
+  async maintain({ workspacePath, operation = 'scan', commandId, roots, paths, message, conflictId, choice, actor = 'user' } = {}) {
+    const workspace = this.findWorkspace(workspacePath);
+    if (!['state', 'scan', 'notify', 'resolve', 'configure', 'dismiss'].includes(operation)) throw new BoardError('INVALID_OPERATION', '未知维护操作');
+    if (commandId != null && (typeof commandId !== 'string' || !commandId || commandId.length > 120)) throw new BoardError('INVALID_COMMAND_ID', 'commandId 无效');
+    const loaded = await this.store.read(workspace.path);
+    if (!loaded.exists) throw new BoardError('BOARD_NOT_FOUND', '该 workspace 还没有看板', 404);
+    if (operation === 'state') return { board: loaded.board, summary: loaded.board.maintenance?.lastSummary || '尚未扫描' };
+    if (commandId && loaded.board.applied.some(r => r.id === commandId)) return { board: loaded.board, summary: loaded.board.maintenance?.lastSummary || '', replayed: true };
+    if (operation === 'configure') {
+      if (!Array.isArray(roots) || roots.length > 30 || roots.some(p => typeof p !== 'string' || (p !== '.' && !maintenancePath(workspace.path, p)))) throw new BoardError('INVALID_ROOTS', '请提供项目内检查目录列表，留空使用已关联活动范围');
+      return this.commitMaintenance(workspace, board => { const m = maintenanceState(board); m.scope = roots.length ? 'custom' : 'linked'; m.roots = [...new Set(roots)]; return { summary: roots.length ? '已保存额外检查范围' : '已恢复已关联活动范围' }; }, { commandId });
+    }
+    if (operation === 'dismiss') {
+      if (!Array.isArray(paths) || !paths.length || paths.length > 200) throw new BoardError('INVALID_CANDIDATES', '请明确列出要忽略的候选路径');
+      return this.commitMaintenance(workspace, board => {
+        const m = maintenanceState(board);
+        const selected = paths.map(p => m.candidates.find(c => c.path === p && c.status !== 'linked'));
+        if (selected.some(c => !c)) throw new BoardError('CANDIDATE_CHANGED', '候选线索已改变，请重读维护状态', 409);
+        for (const candidate of selected) { candidate.status = 'dismissed'; candidate.reason = asString(message, LIMITS.short, '与当前项目任务无关，仅保留盘上资料。'); }
+        return { summary: `已将 ${selected.length} 条无关资料线索标记为忽略；盘上文件未改动。` };
+      }, { commandId });
+    }
+    if (operation === 'resolve') {
+      const conflict = loaded.board.maintenance?.conflicts.find(c => c.id === conflictId && c.status === 'open');
+      if (conflict?.kind === 'field') {
+        const check = await discoverBoardContent(workspace.path, { roots: [conflict.sourcePath] });
+        if (!check.candidates.some(c => c.path === conflict.sourcePath && c.fingerprint === conflict.fingerprint)) throw new BoardError('CONFLICT_CHANGED', '盘上来源已变化，请先更新看板后再决定', 409);
+      }
+      const result = await this.commitMaintenance(workspace, board => { resolveMaintenanceChoice(board, conflictId, choice); return { summary: '已保存维护决定' }; }, { commandId });
+      await this.processArchives(workspace.path);
+      return { ...result, board: (await this.store.read(workspace.path)).board };
+    }
+    if (operation === 'notify' && actor === `agent:${loaded.board.assistant?.sessionId}`) throw new BoardError('SELF_NOTIFY', '维护助手不能通知自己再次唤醒；请直接完成当前维护', 409);
+    const running = this.maintenanceRuns.get(workspace.path);
+    if (running) {
+      // prompt一旦封口，后到通知必须排下一波；不能把未投递的附言标记为已处理。
+      if (running.phase !== 'scanning') {
+        await running.promise;
+        return this.maintain({ workspacePath, operation, commandId, roots, paths, message, conflictId, choice, actor });
+      }
+      if (commandId) running.requestIds.add(commandId);
+      running.dirty = true;
+      if (operation === 'notify') { running.notify = true; running.message = [...new Set([running.message, asString(message, 4000)].filter(Boolean))].join('\n').slice(0, 8000); }
+      return { ...(await running.promise), coalesced: true };
+    }
+    const run = { phase: 'scanning', notify: operation === 'notify', message: asString(message, 4000), requestIds: new Set(commandId ? [commandId] : []), promise: null };
+    this.maintenanceRuns.set(workspace.path, run);
+    run.promise = (async () => {
+      const discovery = await discoverBoardContent(workspace.path, { roots: maintenanceScanRoots(loaded.board) });
+      let result = await this.commitMaintenance(workspace, board => mergeBoardContent(board, discovery), { commandId: operation === 'scan' ? commandId : undefined, operation: 'maintenance_scan' });
+      if (run.dirty) {
+        run.phase = 'finishing';
+        run.dirty = false;
+        const latest = (await this.store.read(workspace.path)).board;
+        const supplement = await discoverBoardContent(workspace.path, { roots: maintenanceScanRoots(latest) });
+        result = await this.commitMaintenance(workspace, board => mergeBoardContent(board, supplement), { operation: 'maintenance_scan' });
+      }
+      await this.processArchives(workspace.path);
+      result.board = (await this.store.read(workspace.path)).board;
+      run.phase = 'notifying';
+      if (run.notify) {
+        if (!this.wakeAssistant) throw new BoardError('WAKE_UNAVAILABLE', '磁盘同步已保存；当前宿主未提供维护会话唤醒能力', 503);
+        const sessionId = result.board.assistant?.sessionId;
+        if (!sessionId) throw new BoardError('ASSISTANT_NOT_READY', '磁盘同步已保存；请先打开看板 Lead 会话，再通知维护', 409);
+        await this.wakeAssistant({ sessionId, workspacePath: workspace.path, prompt: maintenancePrompt(result.board, run.message), requestIds: run.requestIds.size ? [...run.requestIds] : [newId('notification')] });
+        result = await this.commitMaintenance(workspace, board => {
+          for (const id of run.requestIds) board.applied.unshift({ id, revision: board.revision + 1, at: isoNow() });
+          return { summary: result.summary + ' 已通知看板 Lead。', sessionId };
+        });
+      }
+      return result;
+    })();
+    try { return await run.promise; }
+    finally { if (this.maintenanceRuns.get(workspace.path) === run) this.maintenanceRuns.delete(workspace.path); }
+  }
+
+  async processArchives(workspacePath) {
+    const workspace = this.findWorkspace(workspacePath);
+    const loaded = await this.store.read(workspacePath);
+    if (!loaded.board?.maintenance?.deletions.some(d => d.status === 'pending')) return;
+    await this.commitMaintenance(workspace, async board => {
+      const m = maintenanceState(board);
+      for (const deletion of m.deletions.filter(d => d.status === 'pending')) {
+        try {
+          if (!deletion.ownershipConfirmed) throw new BoardError('ARCHIVE_CONFLICT', '尚未确认这些链接和产物属于本条目的独占归档范围。请核对路径后选择重试归档，或保留文件。', 409);
+          if (deletion.wasActive) throw new BoardError('ARCHIVE_CONFLICT', '条目删除前仍在进行中，或作业终态未核实；文件已保留。确认作业结束后再重试归档。', 409);
+          const agents = this.ctx.agents?.list?.() || [];
+          const live = agents.filter(a => a.status === 'running' && (deletion.sessionIds.includes(a.id) || (a.id !== board.assistant?.sessionId && a.session?.header?.cwd && (a.session.header.cwd === workspacePath || a.session.header.cwd.startsWith(workspacePath + path.sep)))));
+          if (live.length) throw new BoardError('ARCHIVE_CONFLICT', '项目仍有运行中的会话，暂缓移动对应文件；会话结束后可重试归档。', 409);
+          // idle会话仍可有后台作业；读取真实registry而不消费输出或激活会话。
+          const sessionIds = new Set([...deletion.sessionIds, ...agents.filter(a => a.session?.header?.cwd && (a.session.header.cwd === workspacePath || a.session.header.cwd.startsWith(workspacePath + path.sep))).map(a => a.id), ...board.tasks.flatMap(t => (t.threads || []).map(s => s.sessionId)), ...board.todos.flatMap(t => (t.threads || []).map(s => s.sessionId))]);
+          if (!this.ctx.jobs?.list) throw new BoardError('ARCHIVE_CONFLICT', '当前无法核实关联会话的后台作业终态，文件已保留。', 409);
+          if (this.ctx.jobs.list().some(j => ['running', 'stopping'].includes(j.status))) throw new BoardError('ARCHIVE_CONFLICT', '存在未归属会话的运行中后台作业，无法排除文件占用，暂缓归档。', 409);
+          for (const id of sessionIds) {
+            const jobs = this.ctx.jobs.list(id);
+            if (jobs.some(j => ['running', 'stopping'].includes(j.status))) throw new BoardError('ARCHIVE_CONFLICT', '项目仍有运行中或正在停止的后台作业，文件已保留；终态后可重试归档。', 409);
+          }
+          const references = boardFileReferences(board).filter(ref => {
+            // 顶层主题的目录导航不把其每个子项目都声明为共享输入；来源/产物/所有权仍受保护。
+            const node = ref.targetType === 'node' && board.nodes.find(n => n.id === ref.targetId);
+            const navigation = node?.kind === 'theme' && ref.role === 'link' && !(node.ownedPaths || []).some(p => maintenancePath(workspacePath, p) === ref.path) && (node.links || []).some(link => link.kind === 'dir' && maintenancePath(workspacePath, link.path) === ref.path);
+            return !(navigation && deletion.paths.some(p => p.startsWith(ref.path + '/')) && !deletion.paths.includes(ref.path));
+          });
+          deletion.receipt = await archiveBoardContent(workspacePath, { operationId: deletion.id, paths: deletion.paths, references });
+          deletion.status = 'archived'; deletion.reason = '独占内容已归档，原路径和SHA清单保存在归档回执中。';
+        } catch (error) {
+          deletion.status = 'needs_decision'; deletion.reason = String(error?.message || error).slice(0, 4000);
+          addMaintenanceConflict(board, { id: 'archive-' + deletion.id, kind: 'archive', targetType: deletion.targetType, targetId: deletion.targetId, title: deletion.title, deletionId: deletion.id, sourcePath: deletion.paths[0] || '', current: deletion.reason, proposed: '', fingerprint: '' },
+            `归档需要决定：「${deletion.title}」。${deletion.reason} 路径：${deletion.paths.slice(0, 8).join('、')}。可保留文件，或在消除占用/共享引用后重试归档。`);
+        }
+      }
+      return { summary: '已处理删除归档队列；不确定项已保留原件并登记需决定。' };
+    }, { operation: 'maintenance_archive' });
   }
 
   applyCommand(board, action, body, actor) {
@@ -533,6 +708,7 @@ export class BoardService {
       }
       case 'upsert_decision': {
         const decision = requireObject(body.decision, 'decision');
+        if (decision.status === 'answered' && board.maintenance?.conflicts.some(c => c.decisionId === decision.id && c.status === 'open')) throw new BoardError('MAINTENANCE_DECISION', '此问题会应用维护变更，请在维护记录中选择对应选项，或让看板Lead用project_board_maintain resolve处理', 409);
         if (decision.id && board.decisions.some((row) => row.id === decision.id)) {
           const existing = board.decisions.find((row) => row.id === decision.id);
           Object.assign(existing, decision, { updatedAt: now });

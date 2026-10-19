@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-board",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Workspace project boards, linked conversations, and Agent Team dispatch for DeepSeek Harness Web.",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/skelviper/dsh-project-board.git" },
@@ -16,7 +16,7 @@
   },
   "files": [
     "entry.mjs", "host.mjs", "client.js", "cordis.patch.yml",
-    "board-model.js", "index.mjs", "schema.mjs", "store.mjs", "service.mjs", "thread.mjs",
+    "board-model.js", "index.mjs", "schema.mjs", "store.mjs", "service.mjs", "thread.mjs", "conversation-context.mjs", "maintenance.mjs", "maintenance-files.mjs",
     "build-host.mjs", "build-client.mjs", "client-src/", "docs/", "README.md", "LICENSE", "CHANGELOG.md"
   ],
   "scripts": {

@@ -51,15 +51,15 @@ Replace the absolute path with your checkout location. The [package manifest](pa
 
 Once DSH Web has loaded the plugin, refresh its existing page. Open **看板** (Board) in the sidebar, select a registered workspace, and click **创建看板** (Create board). An expanded workspace also has a **项目看板** (Project board) entry beneath its header.
 
-### Planned GitHub installation
+### Install from GitHub
 
-The following is a future installation form, **not an available release announcement**:
+With the required Agent Team bundle enabled, install the tagged release directly:
 
 ```sh
-dsh plugin --profile web add github:OWNER/dsh-project-board#v0.1.0
+dsh plugin --profile web add github:skelviper/dsh-project-board#v0.1.0
 ```
 
-**`OWNER` is an unresolved placeholder.** Replace it only after the actual GitHub owner, repository, and `v0.1.0` tag have been published. No GitHub location or published release is asserted here.
+Source and release assets are available from [skelviper/dsh-project-board](https://github.com/skelviper/dsh-project-board) and its [v0.1.0 release](https://github.com/skelviper/dsh-project-board/releases/tag/v0.1.0). For an offline plugin archive, download `dsh-project-board-0.1.0.tgz` and pass its absolute path to the same `dsh plugin --profile web add` command.
 
 ### Migrate an existing manual installation
 

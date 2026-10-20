@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- Add canvas marquee selection and Shift/Ctrl/Command selection adjustments.
+- Move selected nodes together in one position save, retaining their preview until the save completes.
+- Keep selection while panning with the middle button, Alt-drag, or touch; clear it with Esc or an empty click.
+- Arrange nested branches using measured card heights, with direct horizontal links for single-child chains.
+- Clear stale selections after project changes and external node deletion.
+- Correct modifier-click removal of a nonfirst selected node and preserve the displayed origin during rapid consecutive drags.
+- Keep input-field and dialog Escape actions from clearing the underlying canvas selection.
+- Preserve the archive permission and conversation-context boundary fixes from 0.2.1.
+
 ## 0.2.1
 
 - Add on-demand disk discovery, persistent source baselines, and field-level three-way merges through the Board Lead and a maintenance API/tool.

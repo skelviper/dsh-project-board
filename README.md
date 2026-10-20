@@ -2,11 +2,12 @@
 
 A project board for DSH Web: one independent board per workspace, with a draggable canvas, tasks, todos, linked DSH conversations, and Agent Team dispatch.
 
-Version **0.2.1** · **MIT** · **Chinese UI**. This standalone repository contains the plugin source copied through an explicit file allowlist. It includes no live workspace boards, conversation histories, or project screenshots.
+Version **0.2.2** · **MIT** · **Chinese UI**. This standalone repository contains the plugin source copied through an explicit file allowlist. It includes no live workspace boards, conversation histories, or project screenshots.
 
 ## Features
 
 - Organize milestones, components, documents, and other work as nodes; connect them with containment, dependency, or output relationships.
+- Marquee-select nodes, adjust the selection with modifier keys, and drag selected cards together; arrange nested branches and horizontal step chains.
 - Break nodes into tasks and todos with acceptance criteria, owners, dependencies, advisory write scopes, notes, decisions, and artifact references.
 - Link multiple DSH sessions to each task or todo. Read and continue conversations inside the board, using native DSH history, drafts, attachments, model selection, and reasoning settings.
 - Give agents a board summary in their runtime context; use `project_board_get`, `project_board_update`, and `project_board_dispatch` to coordinate planning and execution.
@@ -63,10 +64,10 @@ Once DSH Web has loaded the plugin, refresh its existing page. Open **看板** (
 With the required Agent Team bundle enabled, install the tagged release directly:
 
 ```sh
-dsh plugin --profile web add github:skelviper/dsh-project-board#v0.2.1
+dsh plugin --profile web add github:skelviper/dsh-project-board#v0.2.2
 ```
 
-Source and release assets are available from [skelviper/dsh-project-board](https://github.com/skelviper/dsh-project-board) and its [v0.2.1 release](https://github.com/skelviper/dsh-project-board/releases/tag/v0.2.1). For an offline plugin archive, download `dsh-project-board-0.2.1.tgz` and pass its absolute path to the same `dsh plugin --profile web add` command.
+Source and release assets are available from [skelviper/dsh-project-board](https://github.com/skelviper/dsh-project-board) and its [v0.2.2 release](https://github.com/skelviper/dsh-project-board/releases/tag/v0.2.2). For an offline plugin archive, download `dsh-project-board-0.2.2.tgz` and pass its absolute path to the same `dsh plugin --profile web add` command.
 
 ### Migrate an existing manual installation
 
@@ -93,7 +94,7 @@ After host changes, restart DSH Web to clear the ESM module cache. After browser
 
 ## Validation
 
-Version 0.2.1 passes 247 automated tests on Node.js 24, including source deduplication, three-way merges, archive manifests and interrupted moves, running jobs, durable deletion markers, notification coalescing, draft field bases, task-context updates, cross-workspace archive denial, and read-only sandbox enforcement. The host registers four tools, eight authenticated routes, and a pre-step task-context hook. CI checks Node.js 22 and 24; pushed version tags publish release archives only after both checks pass.
+Version 0.2.2 passes 257 automated tests on Node.js 24, including marquee and modifier selection, grouped and consecutive drags, input/dialog Escape handling, source deduplication, three-way merges, archive manifests and interrupted moves, running jobs, durable deletion markers, notification coalescing, draft field bases, task-context updates, cross-workspace archive denial, and read-only sandbox enforcement. The host registers four tools, eight authenticated routes, and a pre-step task-context hook. CI checks Node.js 22 and 24; pushed version tags publish release archives only after both checks pass.
 
 These checks use isolated temporary projects. The extracted release has not replaced an existing live installation or received a new browser acceptance run.
 

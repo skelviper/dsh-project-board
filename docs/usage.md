@@ -1,6 +1,6 @@
 # Usage guide
 
-`dsh-project-board` 0.2.1 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
+`dsh-project-board` 0.2.2 adds a project board to DSH Web. The UI is Chinese; the labels below include English explanations. Follow the [installation and migration instructions](../README.md) first. Compatibility is validated only with DSH `0.2.1-rc.2` and Node.js `>=22`.
 
 ## Create a board for a workspace
 
@@ -39,7 +39,9 @@ The Board Lead can change the board through the plugin tools. Opening a conversa
 ## Work with the canvas and inspector
 
 - Click **节点** (Node) or double-click empty canvas space to create a node. Drag nodes to position them; positions save automatically.
-- Use the mouse wheel and the lower-left controls to zoom, or **适应** (Fit) to fit the board. **自动整理** (Auto arrange) reorganizes node positions.
+- Use the mouse wheel and the lower-left controls to zoom, or **适应** (Fit) to fit the board. **自动整理** (Auto arrange) uses card heights to arrange nested branches and places single-child chains horizontally.
+- Drag empty canvas space to select intersecting cards. Shift-drag adds cards; Shift/Ctrl/Command-click adds or removes one card. Drag any selected card to move the group in one position save. Pending saves retain the displayed positions so a rapid second drag starts from the current preview.
+- Pan with the middle mouse button, Alt-drag, or touch without clearing selection. Click empty space or press Esc to clear selection. Text fields and active dialogs handle their own Esc action.
 - Choose **连线** (Connect), select a relationship type, then click the source and target nodes. **归属** (`contains`) runs from parent to child; **依赖** (`depends`) from prerequisite to dependent; **产出** (`produces`) from source to output. The containment UI prevents multiple parents and cycles.
 - Click or right-click an edge to select it and open its menu. **删除连线** (Delete edge) removes that edge. Press Esc or click empty space to dismiss the selection.
 - Select a node to open its inspector. **概览和任务** (Overview and tasks) contains the editable summary and task list; **产物** (Artifacts) collects registered files; **历史** (History) contains notes and decisions.
@@ -159,7 +161,7 @@ For session bindings, use `action: "bind_thread"` with `input` containing exactl
 
 ## Stored data model
 
-The schema version remains `1`; the package version is `0.2.1`. The main structures are:
+The schema version remains `1`; the package version is `0.2.2`. The main structures are:
 
 ```text
 board:  { version, revision, workspacePath, title, nodes[], edges[], tasks[],

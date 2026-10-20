@@ -39,7 +39,9 @@ function ProjectBoardPanel(props) {
   const [loading, setLoading] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
-  const [selectedNodeId, setSelectedNodeId] = React.useState(null);
+  const [selectedNodeIds, setSelectedNodeIds] = React.useState([]);
+  // 单选入口仍用 selectedNodeId；框选/多选时它为空，检查器显示多选摘要。
+  const selectedNodeId = selectedNodeIds.length === 1 ? selectedNodeIds[0] : null;
   const [selectedEdgeId, setSelectedEdgeId] = React.useState(null);
   const [taskFocus, setTaskFocus] = React.useState(null);
   const [conversation, setConversation] = React.useState(null);
@@ -58,6 +60,11 @@ function ProjectBoardPanel(props) {
   const guardWorkspace = (callback) => (...args) => { if (isCurrentWorkspace()) return callback(...args); };
   function assertCurrentWorkspace() {
     if (!isCurrentWorkspace()) throw new Error('项目已切换，请在当前项目重试');
+  }
+  // 画布选择统一入口：单选、Shift 加选和框选都写入同一集合。
+  function selectNodes(ids) {
+    if (!isCurrentWorkspace()) return;
+    setSelectedNodeIds([...new Set((ids || []).filter(Boolean))]);
   }
   function applyBoard(next, nextExists = true) {
     if (!isCurrentWorkspace()) return false;
@@ -157,7 +164,7 @@ function ProjectBoardPanel(props) {
     fittedRef.current = '';
     setWorkspacePath(path); setBoard(null); setExists(false); setLoading(Boolean(path));
     setBusy(false); setError(''); setNotice('');
-    setSelectedNodeId(null); setSelectedEdgeId(null); setTaskFocus(null);
+    setSelectedNodeIds([]); setSelectedEdgeId(null); setTaskFocus(null);
     setConversation(null); setArtifact(null); setNodeModal(null);
     connectionInFlight.current = false;
     setConnectMode(false); setConnectSource(null); setConnectPending(false); setConnectKind('contains');
@@ -250,7 +257,7 @@ function ProjectBoardPanel(props) {
       const value = await pbFetchJson('/api/project-board/state?' + pbWorkspaceQuery(path));
       if (!currentRequest() || !applyBoard(value.exists ? value.board : null, Boolean(value.exists))) return;
       if (options.keepSelection !== true) {
-        setSelectedNodeId(null); setSelectedEdgeId(null); setTaskFocus(null); setConversation(null);
+        setSelectedNodeIds([]); setSelectedEdgeId(null); setTaskFocus(null); setConversation(null);
       }
       if (!options.keepError) setError('');
     } catch (err) {
@@ -260,6 +267,13 @@ function ProjectBoardPanel(props) {
   }, [scope]);
 
   React.useEffect(() => { loadWorkspaceInfo(); }, [loadWorkspaceInfo]);
+
+  // 看板更新（外部编辑或删除）后剔除已不存在的节点，避免多选残留幽灵 id。
+  React.useEffect(() => {
+    if (!board) return;
+    const known = new Set(board.nodes.map((node) => node.id));
+    setSelectedNodeIds((ids) => (ids.some((id) => !known.has(id)) ? ids.filter((id) => known.has(id)) : ids));
+  }, [board]);
 
   React.useEffect(() => {
     if (!workspacePath && workspaceItems.length) {
@@ -348,7 +362,7 @@ function ProjectBoardPanel(props) {
         if (!response?.board) throw new Error('保存未返回看板，请刷新后重试');
         applyBoard(response.board);
         if (commandAction === 'delete_todo' || commandAction === 'delete_task') setConversation((current) => current?.targetId === commandInput?.id ? null : current);
-        if (commandAction === 'delete_node') setSelectedNodeId((current) => current === commandInput?.id ? null : current);
+        if (commandAction === 'delete_node') setSelectedNodeIds((ids) => ids.filter((id) => id !== commandInput?.id));
         if (commandAction === 'create_board') loadWorkspaceInfo();
         return { ...response, committedBoard: response.board, board: boardRef.current };
       }
@@ -427,8 +441,8 @@ function ProjectBoardPanel(props) {
       box.minY = Math.min(box.minY, node.y);
       box.maxX = Math.max(box.maxX, node.x + pbCanvasNodeWidth(node));
       const extraRows = Math.max(0, (currentLayout?.previews.get(node.id)?.visible.length || 0) - 3);
-      const height = ['figure', 'milestone', 'component'].includes(node.kind) && pbNodeTasks(targetBoard || board, node.id).length ? 176 + extraRows * 26 : 130;
-      box.maxY = Math.max(box.maxY, node.y + height);
+      const height = canvasNodeHeight(targetBoard || board, node);
+      box.maxY = Math.max(box.maxY, node.y + height + extraRows * 26);
     }
     const width = Math.max(200, box.maxX - box.minX);
     const height = Math.max(160, box.maxY - box.minY);
@@ -438,29 +452,85 @@ function ProjectBoardPanel(props) {
     setView({ x: offsetX - box.minX * scale, y: offsetY - box.minY * scale, scale });
   }
 
+  // 画布卡片的高度以真实 DOM 为准（场景整体 CSS 缩放，需除以 view.scale）；
+  // 画布未挂载时退回保守估算。
+  function measuredNodeHeight(nodeId) {
+    if (typeof document === 'undefined') return 0;
+    const el = document.querySelector(`.pb-node[data-node-id="${nodeId}"]`);
+    if (!el) return 0;
+    const scale = view?.scale || 1;
+    const height = el.getBoundingClientRect().height / (scale || 1);
+    return Number.isFinite(height) && height > 40 ? height : 0;
+  }
+
+  function estimatedNodeHeight(sourceBoard, node) {
+    const tasks = pbNodeTasks(sourceBoard, node.id).length;
+    if (['figure', 'milestone', 'component'].includes(node.kind) && tasks) return 190 + Math.min(3, tasks) * 24 + (tasks > 3 ? 24 : 0);
+    return node.kind === 'theme' ? 158 : 174;
+  }
+
+  function canvasNodeHeight(sourceBoard, node) {
+    return measuredNodeHeight(node.id) || estimatedNodeHeight(sourceBoard, node);
+  }
+
+  // 自动整理：主题按一列自上而下排，每个主题的子树递归排在其下方；
+  // 只有一个子节点的线性链（如阶段①→②→③）在同一行横排向右，
+  // 归属连线直接走父卡右边缘→子卡左边缘的直线（见 pbEdgePath）。
+  // 高度用实测卡片高度，保证不重叠。
   function autoLayout() {
     if (!board || !isCurrentWorkspace()) return;
     const byId = new Map(board.nodes.map((node) => [node.id, node]));
-    const themes = board.nodes.filter((node) => node.kind === 'theme');
-    const childIds = new Set();
+    const rank = new Map(board.nodes.map((node, index) => [node.id, index]));
+    const childrenOf = (id) => board.edges
+      .filter((edge) => edge.kind === 'contains' && edge.from === id)
+      .map((edge) => byId.get(edge.to))
+      .filter((child) => child && child.id !== id)
+      .sort((left, right) => (rank.get(left.id) ?? 0) - (rank.get(right.id) ?? 0));
     const positions = [];
-    themes.forEach((theme, index) => {
-      const x = 60 + index * 320;
-      positions.push({ id: theme.id, x, y: 60 });
-      const children = board.edges.filter((edge) => edge.kind === 'contains' && edge.from === theme.id).map((edge) => byId.get(edge.to)).filter(Boolean);
-      let y = 220;
-      for (const child of children) {
-        positions.push({ id: child.id, x: x + 30, y });
-        childIds.add(child.id);
-        y += ['figure', 'milestone', 'component'].includes(child.kind) && pbNodeTasks(board, child.id).length ? 196 : 150;
+    const placedIds = new Set();
+    const X0 = 60;
+    const Y0 = 60;
+    const GAP = 64;
+    const SECTION_GAP = GAP * 2;
+    const INDENT = 30;
+    const CHAIN_STEP = 0;
+    const CHAIN_GAP = 32;
+    function place(node, x, y) {
+      if (!node || placedIds.has(node.id)) return null;
+      placedIds.add(node.id);
+      const width = pbCanvasNodeWidth(node);
+      const height = canvasNodeHeight(board, node);
+      positions.push({ id: node.id, x: Math.round(x), y: Math.round(y) });
+      const box = { minX: x, minY: y, maxX: x + width, maxY: y + height };
+      const children = childrenOf(node.id).filter((child) => !placedIds.has(child.id));
+      if (children.length === 1) {
+        const childBox = place(children[0], x + width + CHAIN_GAP, y + CHAIN_STEP);
+        if (childBox) {
+          box.maxX = Math.max(box.maxX, childBox.maxX);
+          box.maxY = Math.max(box.maxY, childBox.maxY);
+        }
+      } else if (children.length > 1) {
+        let cursorY = y + height + GAP;
+        for (const child of children) {
+          const childBox = place(child, x + INDENT, cursorY);
+          if (!childBox) continue;
+          box.maxX = Math.max(box.maxX, childBox.maxX);
+          box.maxY = Math.max(box.maxY, childBox.maxY);
+          cursorY = childBox.maxY + GAP;
+        }
       }
-    });
-    let looseY = 220;
-    const loose = board.nodes.filter((node) => !themes.includes(node) && !childIds.has(node.id));
-    loose.forEach((node, index) => {
-      const perRow = Math.max(1, Math.floor((viewport.width - 120) / 260));
-      positions.push({ id: node.id, x: 60 + (index % perRow) * 270, y: looseY + Math.floor(index / perRow) * 160 });
-    });
+      return box;
+    }
+    let cursorY = Y0;
+    for (const theme of board.nodes.filter((node) => node.kind === 'theme')) {
+      const box = place(theme, X0, cursorY);
+      if (box) cursorY = box.maxY + SECTION_GAP;
+    }
+    for (const node of board.nodes) {
+      if (placedIds.has(node.id)) continue;
+      const box = place(node, X0, cursorY);
+      if (box) cursorY = box.maxY + GAP;
+    }
     runCommand('save_positions', { positions }, { fitAfter: true });
   }
 
@@ -469,7 +539,7 @@ function ProjectBoardPanel(props) {
     const current = boardRef.current;
     if (!current?.nodes.some((node) => node.id === nodeId)) return;
     if (taskId && !current.tasks.some((task) => task.id === taskId && task.nodeId === nodeId)) return;
-    setSelectedNodeId(nodeId); setSelectedEdgeId(null); setConversation(null);
+    selectNodes([nodeId]); setSelectedEdgeId(null); setConversation(null);
     setRightTab('inspector'); setInspectorTab('overview');
     setTaskFocus({ workspacePath, nodeId, taskId, requestId: pbUuid() });
     if (renderedDockWidth < 100) setDockWidth(clampDock(400));
@@ -508,7 +578,7 @@ function ProjectBoardPanel(props) {
     try {
       const response = await runCommand('__connect_nodes', { source: connectSource, target: nodeId, kind: connectKind }, { throwOnError: true });
       assertCurrentWorkspace();
-      setSelectedNodeId(nodeId); setSelectedEdgeId(null); setConversation(null); setTaskFocus(null);
+      selectNodes([nodeId]); setSelectedEdgeId(null); setConversation(null); setTaskFocus(null);
       setRightTab('inspector'); setInspectorTab('overview');
       setNotice(response.message); setTimeout(guardWorkspace(() => setNotice('')), 4000);
       setConnectSource(null); setConnectMode(false);
@@ -599,12 +669,14 @@ function ProjectBoardPanel(props) {
         onOpenArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })),
         board,
         selectedNodeId,
+        selectedNodeIds,
         selectedEdgeId,
         connectMode,
         connectSource,
         connectPending,
         connectionHint,
-        onSelectNode: guardWorkspace((id) => { setSelectedNodeId(id); setTaskFocus(null); if (!id) setConversation(null); if (id) setRightTab('inspector'); }),
+        onSelectNode: guardWorkspace((id) => { selectNodes(id ? [id] : []); setTaskFocus(null); if (!id) setConversation(null); if (id) setRightTab('inspector'); }),
+        onSelectNodes: guardWorkspace((ids) => { selectNodes(ids); setTaskFocus(null); if (ids && ids.length) setRightTab('inspector'); else setConversation(null); }),
         onOpenTask: openCanvasTask,
         executionFor,
         onSelectEdge: guardWorkspace(setSelectedEdgeId),
@@ -662,10 +734,14 @@ function ProjectBoardPanel(props) {
           onOpenTodo: guardWorkspace((id) => setConversation({ targetType: 'todo', targetId: id })),
           threadUi, tab: inspectorTab, onTabChange: guardWorkspace(setInspectorTab), executionFor,
           taskFocus: taskFocus?.workspacePath === workspacePath && taskFocus.nodeId === selectedNode.id ? taskFocus : null,
-          onClose: guardWorkspace(() => { setSelectedNodeId(null); setTaskFocus(null); setRightTab('assistant'); }),
+          onClose: guardWorkspace(() => { selectNodes([]); setTaskFocus(null); setRightTab('assistant'); }),
           onDispatchTask: (taskId) => runCommand('__dispatch_task', { taskId }),
           onOpenArtifact: guardWorkspace((row) => setArtifact({ workspacePath, row })),
-        }) : h('div', { className: 'pb-empty' }, '选择一个节点查看节点详情、任务与产物。'))));
+        }) : selectedNodeIds.length > 1 ? h('div', { className: 'pb-empty pb-multi-selection' },
+          h('div', { style: { fontSize: 14, fontWeight: 650, marginBottom: 6, color: 'var(--dsw-alias-label-primary,#242a2d)' } }, `已选择 ${selectedNodeIds.length} 个节点`),
+          h('div', { style: { marginBottom: 12, lineHeight: 1.7 } }, '在画布上拖动任一选中卡片即可整体移动；Shift 拖动继续框选加选，Shift 单击可加选或取消单个节点，Esc 取消选择。'),
+          h('button', { className: 'pb-btn', onClick: guardWorkspace(() => selectNodes([])) }, '取消选择'))
+          : h('div', { className: 'pb-empty' }, '选择一个节点查看节点详情、任务与产物。'))));
 
   }
 

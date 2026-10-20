@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-board",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Workspace project boards, linked conversations, and Agent Team dispatch for DeepSeek Harness Web.",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/skelviper/dsh-project-board.git" },

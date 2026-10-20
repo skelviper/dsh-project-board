@@ -37,11 +37,20 @@ function PbIcon({ name, size = 16, color }) {
 const PB_EDGE_OFFSET = 5000;
 
 function pbEdgePath(source, target, kind) {
-  // Hierarchy edges leave the theme from the bottom and enter the child from
-  // the top; dependency/produce edges connect side anchors. Coordinates are
+  // Hierarchy edges leave the parent from the bottom and enter the child from
+  // the top-left; dependency/produce edges connect side anchors. Coordinates are
   // shifted by PB_EDGE_OFFSET because the edge SVG canvas is anchored at
   // (-PB_EDGE_OFFSET, -PB_EDGE_OFFSET).
-  const sx = source.x + pbCanvasNodeWidth(source) / 2 + PB_EDGE_OFFSET;
+  const sourceWidth = pbCanvasNodeWidth(source);
+  // 同一行、向右排列的层级链（如阶段①→②→③）：直接从父卡右边缘横拉到
+  // 子卡左边缘，不再走“下-左-下-右”的绕行折线。
+  if (kind === 'contains' && target.x > source.x + sourceWidth - 2 && Math.abs(target.y - source.y) <= 8) {
+    const y = source.y + 56 + PB_EDGE_OFFSET;
+    const fromX = source.x + sourceWidth + PB_EDGE_OFFSET;
+    const toX = target.x - 2 + PB_EDGE_OFFSET;
+    return `M${fromX} ${y} L${toX} ${y}`;
+  }
+  const sx = source.x + sourceWidth / 2 + PB_EDGE_OFFSET;
   const tx = (kind === 'contains' ? target.x - 2 : target.x + pbCanvasNodeWidth(target) / 2 - 2) + PB_EDGE_OFFSET;
   const sy = source.y + (kind === 'contains' ? 96 : 48) + PB_EDGE_OFFSET;
   const ty = target.y + (kind === 'contains' ? 0 : 48) + PB_EDGE_OFFSET;
@@ -58,11 +67,15 @@ function pbEdgePath(source, target, kind) {
   return `M${sx} ${sy} C${c1x} ${sy}, ${c2x} ${ty}, ${tx} ${ty}`;
 }
 
-function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selectedNodeId, selectedEdgeId, connectMode, connectSource, connectPending, connectionHint, onSelectNode, onOpenTask, executionFor, onSelectEdge, onDeleteEdge, onConnectNode, onCreateAt, onMoveNodes, onFit, onLayout, view, setView, onViewport }) {
+function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selectedNodeId, selectedNodeIds, selectedEdgeId, connectMode, connectSource, connectPending, connectionHint, onSelectNode, onSelectNodes, onOpenTask, executionFor, onSelectEdge, onDeleteEdge, onConnectNode, onCreateAt, onMoveNodes, onFit, onLayout, view, setView, onViewport }) {
   const wrapRef = React.useRef(null);
   const interaction = React.useRef(null);
   const edgeMenuRef = React.useRef(null);
-  const [dragNode, setDragNode] = React.useState(null);
+  // 拖动预览：框选出的多个节点共享同一个场景位移；保存返回前用本地坐标顶住，避免松手闪回。
+  const [dragGroup, setDragGroup] = React.useState(null);
+  const [heldPositions, setHeldPositions] = React.useState(null);
+  const [marquee, setMarquee] = React.useState(null);
+  const dragCommitRef = React.useRef(0);
   const [edgeMenu, setEdgeMenu] = React.useState(null);
   const [deletingEdge, setDeletingEdge] = React.useState(false);
   const [edgeError, setEdgeError] = React.useState('');
@@ -75,6 +88,10 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
   const layout = pbCanvasExpandedLayout(board.nodes, previews);
   React.useLayoutEffect(() => { onLayout?.({ board, nodes: layout.nodes, previews }); });
   const menuEdge = edgeMenu && selectedEdgeId === edgeMenu.id ? board.edges.find((edge) => edge.id === edgeMenu.id) : null;
+  // selectedNodeId 是兼容单选入口；selectedNodeIds 是框选/多选的真实集合。
+  const selectedIds = Array.isArray(selectedNodeIds) ? selectedNodeIds : (selectedNodeId ? [selectedNodeId] : []);
+  const selectedSet = new Set(selectedIds);
+  const layoutById = new Map(layout.nodes.map((node) => [node.id, node]));
 
   React.useEffect(() => {
     if (!menuEdge) return undefined;
@@ -90,6 +107,22 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
   }, [Boolean(menuEdge), onSelectEdge]);
 
   React.useEffect(() => { setEdgeMenu(null); }, [view.x, view.y, view.scale, connectMode]);
+  // 多选后按 Esc 一次清空选择；连接模式下的 Esc 仍由面板的取消逻辑处理。
+  React.useEffect(() => {
+    if (!selectedSet.size && !marquee) return undefined;
+    const onKey = (event) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (event.target?.closest?.('input, textarea, select, [contenteditable="true"], [role="dialog"], [role="alertdialog"]')) return;
+      if (document.querySelector?.('.pb-preview-mask, .pb-modal-mask, [role="dialog"], [role="alertdialog"]')) return;
+      interaction.current = null;
+      setDragGroup(null);
+      setMarquee(null);
+      setHeldPositions(null);
+      selectByIds([]);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [selectedSet.size, Boolean(marquee), onSelectNodes, onSelectNode]);
   React.useEffect(() => { if (menuEdge) edgeMenuRef.current?.querySelector('.pb-edge-delete')?.focus({ preventScroll: true }); }, [menuEdge?.id]);
 
   React.useLayoutEffect(() => {
@@ -165,14 +198,70 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
     return Boolean(target?.closest('.pb-toolbar, .pb-legend, .pb-edge-menu, .pb-edge-hit, button, a, input, select, textarea, [role="button"]'));
   }
 
+  function selectByIds(ids) {
+    const unique = [...new Set((ids || []).filter(Boolean))];
+    if (typeof onSelectNodes === 'function') onSelectNodes(unique);
+    else onSelectNode?.(unique.length ? unique[0] : null);
+  }
+
+  function screenPoint(event) {
+    const rect = wrapRef.current?.getBoundingClientRect?.();
+    if (!rect) return { x: event.clientX, y: event.clientY };
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  // 卡片高度只在无 DOM（单元测试/未挂载）时用于框选命中估算，真实页面以卡片矩形为准。
+  function estimatedNodeHeight(node) {
+    if (['figure', 'milestone', 'component'].includes(node.kind)) return 190;
+    return node.kind === 'theme' ? 158 : 174;
+  }
+
+  // 框选命中：优先用真实卡片矩形（包含展开任务后的实际高度），无 DOM 时退回场景坐标估算。
+  function nodesInMarquee(a, b) {
+    const left = Math.min(a.x, b.x), right = Math.max(a.x, b.x);
+    const top = Math.min(a.y, b.y), bottom = Math.max(a.y, b.y);
+    const wrap = wrapRef.current;
+    if (wrap?.querySelectorAll && wrap.getBoundingClientRect) {
+      const cards = wrap.querySelectorAll('.pb-node[data-node-id]');
+      if (cards.length) {
+        const wrapRect = wrap.getBoundingClientRect();
+        const found = [];
+        for (const card of cards) {
+          const rect = card.getBoundingClientRect?.();
+          if (!rect) continue;
+          if (rect.right - wrapRect.left >= left && rect.left - wrapRect.left <= right && rect.bottom - wrapRect.top >= top && rect.top - wrapRect.top <= bottom) found.push(card.getAttribute('data-node-id'));
+        }
+        return found.filter(Boolean);
+      }
+    }
+    const scene = {
+      left: (left - view.x) / view.scale, right: (right - view.x) / view.scale,
+      top: (top - view.y) / view.scale, bottom: (bottom - view.y) / view.scale,
+    };
+    return layout.nodes.filter((node) => node.x <= scene.right && node.x + pbCanvasNodeWidth(node) >= scene.left && node.y <= scene.bottom && node.y + estimatedNodeHeight(node) >= scene.top).map((node) => node.id);
+  }
+
   function startPan(event) {
-    if (event.button !== 0) return;
-    if (event.target.closest('.pb-node')) return;
+    if (event.button !== 0 && event.button !== 1) return;
+    if (event.target.closest?.('.pb-node')) return;
     if (isControlTarget(event.target)) return;
+    event.preventDefault?.();
     interaction.current = { kind: 'pan', startX: event.clientX, startY: event.clientY, origin: view };
-    wrapRef.current.setPointerCapture(event.pointerId);
-    onSelectNode?.(null);
+    wrapRef.current?.setPointerCapture?.(event.pointerId);
+    // 平移不清空节点选择，避免多选后想挪画布又丢选中。
     onSelectEdge?.(null);
+  }
+
+  function startCanvasPointer(event) {
+    if (event.button === 1) { startPan(event); return; }
+    if (event.button !== 0) return;
+    if (event.target.closest?.('.pb-node')) return;
+    if (isControlTarget(event.target)) return;
+    // 触控、Alt+左键保留平移；空白左键拖动改为框选。
+    if (event.altKey || event.pointerType === 'touch') { startPan(event); return; }
+    interaction.current = { kind: 'marquee', startClientX: event.clientX, startClientY: event.clientY, start: screenPoint(event), additive: Boolean(event.shiftKey), moved: false };
+    onSelectEdge?.(null);
+    wrapRef.current?.setPointerCapture?.(event.pointerId);
   }
 
   function startNodeDrag(event, node) {
@@ -180,10 +269,31 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
     event.stopPropagation();
     // 连接只由click/键盘激活一次；pointerdown不能同时选中并清掉source。
     if (connectMode) return;
-    interaction.current = { kind: 'node', id: node.id, startX: event.clientX, startY: event.clientY, origin: { x: node.x, y: node.y }, layoutOffset: layout.offsets.get(node.id) || 0, moved: false };
-    setDragNode({ id: node.id, x: node.x, y: node.y });
-    wrapRef.current.setPointerCapture(event.pointerId);
-    onSelectNode?.(node.id);
+    const modifier = Boolean(event.shiftKey || event.ctrlKey || event.metaKey);
+    const current = selectedIds.slice();
+    const alreadySelected = current.includes(node.id);
+    let ids;
+    if (modifier) {
+      // Shift/Ctrl 点击：加入多选；已选中的节点在 pointerup 时移出（未拖动）。
+      ids = alreadySelected ? current : [...current, node.id];
+      if (!alreadySelected) selectByIds(ids);
+    } else if (alreadySelected && current.length > 1) {
+      // 拖动多选中的任意一张卡片：整体移动。
+      ids = current;
+    } else {
+      ids = [node.id];
+      selectByIds(ids);
+    }
+    const origins = new Map();
+    for (const id of ids) {
+      const layoutNode = layoutById.get(id);
+      if (!layoutNode) continue;
+      const held = heldPositions?.[id];
+      origins.set(id, held ? { x: held.x, y: held.y } : { x: layoutNode.x, y: layoutNode.y - (layout.offsets.get(id) || 0) });
+    }
+    interaction.current = { kind: 'node', clickedId: node.id, ids: [...origins.keys()], startX: event.clientX, startY: event.clientY, origins, dx: 0, dy: 0, moved: false, modifier, wasSelected: alreadySelected };
+    setDragGroup({ ids: [...origins.keys()], origins, dx: 0, dy: 0 });
+    wrapRef.current?.setPointerCapture?.(event.pointerId);
   }
 
   function onPointerMove(event) {
@@ -195,18 +305,63 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
       const dx = (event.clientX - active.startX) / view.scale;
       const dy = (event.clientY - active.startY) / view.scale;
       if (!active.moved && Math.abs(dx) * view.scale < 3 && Math.abs(dy) * view.scale < 3) return;
+      if (!active.moved) { dragCommitRef.current += 1; setHeldPositions(null); }
+      active.moved = true; active.dx = dx; active.dy = dy;
+      setDragGroup({ ids: active.ids, origins: active.origins, dx, dy });
+    } else if (active.kind === 'marquee') {
+      if (!active.moved && Math.abs(event.clientX - active.startClientX) < 3 && Math.abs(event.clientY - active.startClientY) < 3) return;
       active.moved = true;
-      setDragNode({ id: active.id, x: active.origin.x + dx, y: active.origin.y + dy });
+      const point = screenPoint(event);
+      setMarquee({ x1: active.start.x, y1: active.start.y, x2: point.x, y2: point.y });
     }
   }
 
-  function endInteraction() {
+  function endInteraction(event) {
+    event = event || {};
     const active = interaction.current;
     interaction.current = null;
-    if (active?.kind === 'node' && dragNode && active.moved) {
-      onMoveNodes?.([{ id: dragNode.id, x: Math.round(dragNode.x), y: Math.round(dragNode.y - active.layoutOffset) }]);
+    if (active?.kind === 'node') {
+      if (active.moved && active.ids.length) {
+        const targets = active.ids.map((id) => {
+          const origin = active.origins.get(id);
+          return origin ? { id, x: Math.round(origin.x + active.dx), y: Math.round(origin.y + active.dy) } : null;
+        }).filter(Boolean);
+        setDragGroup(null);
+        if (targets.length) {
+          // 保存返回前继续用本地坐标渲染：否则松手瞬间会先闪回原位，等新看板回来再跳到拖到的位置。
+          const token = ++dragCommitRef.current;
+          setHeldPositions(Object.fromEntries(targets.map((target) => [target.id, { x: target.x, y: target.y }])));
+          const pending = onMoveNodes?.(targets);
+          const release = () => { if (dragCommitRef.current === token) setHeldPositions(null); };
+          if (pending && typeof pending.then === 'function') {
+            pending.then(() => undefined, () => undefined).then(release);
+          } else {
+            release();
+          }
+          return;
+        }
+        return;
+      }
+      // Shift/Ctrl 单击已选中的节点：移出多选；普通单击由 click 收敛成单选。
+      if (!active.moved && active.modifier && active.wasSelected) {
+        selectByIds(selectedIds.filter((id) => id !== active.clickedId));
+      }
+      setDragGroup(null);
+      return;
     }
-    setDragNode(null);
+    if (active?.kind === 'marquee') {
+      if (active.moved) {
+        const hits = nodesInMarquee(active.start, screenPoint(event));
+        selectByIds(active.additive ? [...selectedIds, ...hits] : hits);
+      } else {
+        // 空白单击取消选择；只有真正拖动过才生成框选。
+        selectByIds([]);
+        onSelectEdge?.(null);
+      }
+      setMarquee(null);
+      return;
+    }
+    setDragGroup(null);
   }
 
   function zoomAtCenter(factor) {
@@ -221,7 +376,15 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
   }
 
   function nodePosition(node) {
-    return dragNode && dragNode.id === node.id ? { ...node, x: dragNode.x, y: dragNode.y } : node;
+    const offset = layout.offsets.get(node.id) || 0;
+    // 保存返回前顶住本地坐标：hold 里存的是保存值（不含展开偏移）。
+    const held = heldPositions?.[node.id];
+    if (held) return { ...node, x: held.x, y: held.y + offset };
+    if (dragGroup && dragGroup.ids.includes(node.id)) {
+      const origin = dragGroup.origins.get(node.id);
+      return { ...node, x: origin.x + dragGroup.dx, y: origin.y + dragGroup.dy + offset };
+    }
+    return node;
   }
 
   const nodes = layout.nodes.map(nodePosition);
@@ -230,8 +393,8 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
 
   return h('div', {
     ref: wrapRef,
-    className: 'pb-canvas-wrap' + (connectMode ? ' pb-connecting' : ''),
-    onPointerDown: startPan,
+    className: 'pb-canvas-wrap' + (connectMode ? ' pb-connecting' : '') + (marquee ? ' pb-marquee-active' : ''),
+    onPointerDown: startCanvasPointer,
     onPointerMove,
     onPointerUp: endInteraction,
     onPointerCancel: endInteraction,
@@ -295,11 +458,11 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
       const teamTask = node.team || null;
       const resultItems = [node, ...pbNodeTasks(board, node.id).flatMap((task) => [task, ...pbTaskTodos(board, task.id)])];
       const primary = resultItems.map(pbPrimaryArtifact).find(Boolean);
-      const selected = selectedNodeId === node.id;
+      const selected = selectedSet.has(node.id) || Boolean(dragGroup?.ids.includes(node.id));
       const isConnectSource = connecting && connectSource === node.id;
       return h('div', {
         key: node.id,
-        className: 'pb-node' + (matchNodeIds ? (matchNodeIds.has(node.id) ? ' search-match' : ' search-muted') : '') + (hasPreview ? ' pb-node-with-tasks' : '') + (selected ? ' selected' : '') + (dragNode?.id === node.id ? ' dragging' : ''),
+        className: 'pb-node' + (matchNodeIds ? (matchNodeIds.has(node.id) ? ' search-match' : ' search-muted') : '') + (hasPreview ? ' pb-node-with-tasks' : '') + (selected ? ' selected' : '') + (dragGroup?.ids.includes(node.id) ? ' dragging' : ''),
         style: { left: node.x, top: node.y, width: pbCanvasNodeWidth(node), opacity: connecting && !isConnectSource && !selected ? 0.82 : 1, ...(isConnectSource ? { borderColor: PB_ACCENT, boxShadow: `0 0 0 2px color-mix(in srgb, ${PB_ACCENT} 25%, transparent)` } : null) },
         'data-node-id': node.id,
         role: connectMode ? 'button' : undefined, tabIndex: connectMode ? 0 : undefined,
@@ -309,7 +472,9 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
         onClick: (event) => {
           event.stopPropagation();
           if (connectMode) { if (!connectPending) onConnectNode?.(node.id); return; }
-          onSelectNode?.(node.id);
+          // Shift/Ctrl 的加入与移出已在 pointerdown/pointerup 处理，这里只把普通单击收敛成单选。
+          if (event.shiftKey || event.ctrlKey || event.metaKey) return;
+          selectByIds([node.id]);
         },
         onKeyDown: (event) => {
           if (!connectMode || event.target !== event.currentTarget) return;
@@ -363,6 +528,17 @@ function BoardCanvas({ board, workspacePath, matchNodeIds, onOpenArtifact, selec
           : progress ? h('span', { className: 'pb-chip', style: { marginLeft: 'auto' }, title: `已结束 ${progress.closed}/${progress.total} · 完成 ${progress.done} · 放弃 ${progress.dropped} · 历史 ${progress.historical}` }, `已结束 ${progress.pct}%`) : null),
       progress && !hasPreview ? h('div', { className: 'pb-progress' }, h('span', { style: { width: progress.pct + '%' } })) : null);
     })),
+  marquee ? h('div', {
+    className: 'pb-marquee', 'data-pb-marquee': '', 'aria-hidden': true,
+    style: {
+      left: Math.min(marquee.x1, marquee.x2), top: Math.min(marquee.y1, marquee.y2),
+      width: Math.abs(marquee.x2 - marquee.x1), height: Math.abs(marquee.y2 - marquee.y1),
+    },
+  }) : null,
+  selectedSet.size > 1 && !connectMode ? h('div', { className: 'pb-selection-pill', role: 'status', 'aria-live': 'polite' },
+    h('span', { className: 'pb-selection-count' }, `已选 ${selectedSet.size} 个节点`),
+    h('span', { className: 'pb-meta' }, '拖动任一卡片整体移动 · Shift 继续加选 · Esc 取消'),
+    h('button', { type: 'button', className: 'pb-btn small', onClick: () => selectByIds([]) }, '取消选择')) : null,
   board.nodes.length === 0 ? h('div', { className: 'pb-empty big', style: { position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', pointerEvents: 'none' } },
     h('div', null,
       h('div', { style: { fontSize: 15, fontWeight: 650, marginBottom: 8 } }, '这张看板还是空的'),
